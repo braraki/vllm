@@ -1385,7 +1385,15 @@ class EngineArgs:
         vllm_group.add_argument("--performance-mode", **vllm_kwargs["performance_mode"])
         vllm_group.add_argument(
             "--gemma4-kernel-experiment",
-            **vllm_kwargs["gemma4_kernel_experiment"],
+            type=str,
+            choices=["baseline", "decoder-residual-fusion"],
+            default=EngineArgs.gemma4_kernel_experiment,
+            help=(
+                "Select the Gemma 4 kernel experiment mode. "
+                "'baseline' keeps the existing decoder behavior, while "
+                "'decoder-residual-fusion' enables the gated decoder "
+                "residual fusion experiment."
+            ),
         )
         vllm_group.add_argument(
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
