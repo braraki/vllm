@@ -651,6 +651,10 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
+    gemma4_kernel_experiment: Literal[
+        "baseline",
+        "decoder-residual-fusion",
+    ] = "baseline"
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1380,6 +1384,10 @@ class EngineArgs:
         )
         vllm_group.add_argument("--performance-mode", **vllm_kwargs["performance_mode"])
         vllm_group.add_argument(
+            "--gemma4-kernel-experiment",
+            **vllm_kwargs["gemma4_kernel_experiment"],
+        )
+        vllm_group.add_argument(
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
         )
 
@@ -2090,6 +2098,9 @@ class EngineArgs:
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+        self.additional_config["gemma4_kernel_experiment"] = (
+            self.gemma4_kernel_experiment
+        )
 
         config = VllmConfig(
             model_config=model_config,

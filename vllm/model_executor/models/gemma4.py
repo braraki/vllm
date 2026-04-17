@@ -436,11 +436,15 @@ class Gemma4DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        kernel_experiment: str = "baseline",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = getattr(
             config, "hidden_size_per_layer_input", 0
+        )
+        self.use_decoder_residual_fusion = (
+            kernel_experiment == "decoder-residual-fusion"
         )
 
         layer_idx = extract_layer_index(prefix)
@@ -605,11 +609,16 @@ class Gemma4DecoderLayer(nn.Module):
         )
 
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
+        if self.use_decoder_residual_fusion:
+            hidden_states, residual = self.pre_feedforward_layernorm(
+                hidden_states, residual
+            )
+        else:
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
@@ -851,8 +860,18 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         config = _get_text_config(vllm_config.model_config.hf_config)
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        self.gemma4_kernel_experiment = str(
+            vllm_config.additional_config.get(
+                "gemma4_kernel_experiment", "baseline"
+            )
+        )
         self.config = config
         self.quant_config = quant_config
+        logger.info_once(
+            "Gemma4 kernel experiment mode: %s",
+            self.gemma4_kernel_experiment,
+            scope="local",
+        )
 
         # PLE config values (default to 0 if not present — disables PLE)
         self.hidden_size_per_layer_input = getattr(
@@ -935,6 +954,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                kernel_experiment=self.gemma4_kernel_experiment,
             ),
             prefix=f"{prefix}.layers",
         )
