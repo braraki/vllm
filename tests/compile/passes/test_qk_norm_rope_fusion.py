@@ -273,7 +273,7 @@ def test_qk_norm_rope_fusion_mixed_attention_signatures(dtype):
 
     layer_configs = [
         (16, 4, 128),
-        (10, 10, 256),
+        (8, 1, 512),
     ]
     T = 5
 
@@ -325,5 +325,5 @@ def test_qk_norm_rope_fusion_mixed_attention_signatures(dtype):
         for fused, unfused in zip(fused_outputs, unfused_outputs):
             torch.testing.assert_close(unfused, fused, atol=ATOL, rtol=RTOL)
 
-        assert fusion_pass.matched_count == len(layer_configs)
-        assert backend.op_count(FUSED_QK_ROPE_OP) == len(layer_configs)
+        assert fusion_pass.matched_count == 1
+        assert backend.op_count(FUSED_QK_ROPE_OP) == 1

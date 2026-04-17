@@ -24,6 +24,7 @@ from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 logger = init_logger(__name__)
 
 FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+RMS_NORM_OP = torch.ops.vllm_ir.rms_norm.default
 SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS = {64, 128, 256}
 
 P = ParamSpec("P")
@@ -116,6 +117,25 @@ class QkNormRopePattern:
         view_to_reshape(gm)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        def signature_matches(match: pm.Match) -> bool:
+            rms_input_shapes: list[tuple[int, int]] = []
+            for node in match.nodes:
+                if node.target != RMS_NORM_OP:
+                    continue
+                x, weight = node.args[0], node.args[1]
+                if not isinstance(x, fx.Node) or not isinstance(weight, fx.Node):
+                    return False
+                x_shape = tuple(x.meta["val"].shape)
+                weight_shape = tuple(weight.meta["val"].shape)
+                if x_shape[-1] != self.head_dim or weight_shape[-1] != self.head_dim:
+                    return False
+                rms_input_shapes.append((x_shape[-2], x_shape[-1]))
+
+            return (
+                (self.num_heads, self.head_dim) in rms_input_shapes
+                and (self.num_kv_heads, self.head_dim) in rms_input_shapes
+            )
+
         def pattern(
             qkv: torch.Tensor,
             positions: torch.Tensor,
@@ -197,6 +217,7 @@ class QkNormRopePattern:
                 QkNormRopePattern.fx_view_to_reshape,
             ),
             pm_pass,
+            extra_check=signature_matches,
         )
 
 
