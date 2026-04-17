@@ -654,6 +654,7 @@ class EngineArgs:
     gemma4_kernel_experiment: Literal[
         "baseline",
         "decoder-residual-fusion",
+        "qk-norm-rope-fusion",
     ] = "baseline"
 
     def __post_init__(self):
@@ -1386,13 +1387,19 @@ class EngineArgs:
         vllm_group.add_argument(
             "--gemma4-kernel-experiment",
             type=str,
-            choices=["baseline", "decoder-residual-fusion"],
+            choices=[
+                "baseline",
+                "decoder-residual-fusion",
+                "qk-norm-rope-fusion",
+            ],
             default=EngineArgs.gemma4_kernel_experiment,
             help=(
                 "Select the Gemma 4 kernel experiment mode. "
                 "'baseline' keeps the existing decoder behavior, while "
                 "'decoder-residual-fusion' enables the gated decoder "
-                "residual fusion experiment."
+                "residual fusion experiment. "
+                "'qk-norm-rope-fusion' enables the fused Q/K RMSNorm + "
+                "RoPE compilation experiment."
             ),
         )
         vllm_group.add_argument(
@@ -2089,6 +2096,33 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
+
+        if self.gemma4_kernel_experiment == "qk-norm-rope-fusion":
+            if compilation_config.mode not in (
+                None,
+                CompilationMode.VLLM_COMPILE,
+            ):
+                raise ValueError(
+                    "gemma4_kernel_experiment='qk-norm-rope-fusion' requires "
+                    "CompilationMode.VLLM_COMPILE (or the default auto-selected "
+                    "compile mode)."
+                )
+            if "-rms_norm" in compilation_config.custom_ops:
+                raise ValueError(
+                    "gemma4_kernel_experiment='qk-norm-rope-fusion' is "
+                    "incompatible with custom_ops disabling rms_norm."
+                )
+            if "-rotary_embedding" in compilation_config.custom_ops:
+                raise ValueError(
+                    "gemma4_kernel_experiment='qk-norm-rope-fusion' is "
+                    "incompatible with custom_ops disabling rotary_embedding."
+                )
+
+            compilation_config.pass_config.enable_qk_norm_rope_fusion = True
+            if "+rms_norm" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("+rms_norm")
+            if "+rotary_embedding" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("+rotary_embedding")
 
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
