@@ -59,6 +59,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 
 from .interfaces import (
     EagleModelMixin,
@@ -77,6 +78,13 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_PRE_FF_RESIDUAL_NORM_BASELINE_SCOPE = (
+    "gemma4.decoder.pre_ff_residual_norm:baseline"
+)
+_PRE_FF_RESIDUAL_NORM_FUSION_SCOPE = (
+    "gemma4.decoder.pre_ff_residual_norm:decoder_residual_fusion"
+)
 
 
 def _get_text_config(config):
@@ -609,14 +617,20 @@ class Gemma4DecoderLayer(nn.Module):
         )
 
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.use_decoder_residual_fusion:
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
-        else:
-            hidden_states = hidden_states + residual
-            residual = hidden_states
-            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        pre_ff_scope = (
+            _PRE_FF_RESIDUAL_NORM_FUSION_SCOPE
+            if self.use_decoder_residual_fusion
+            else _PRE_FF_RESIDUAL_NORM_BASELINE_SCOPE
+        )
+        with record_function_or_nullcontext(pre_ff_scope):
+            if self.use_decoder_residual_fusion:
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
+            else:
+                hidden_states = hidden_states + residual
+                residual = hidden_states
+                hidden_states = self.pre_feedforward_layernorm(hidden_states)
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
         hidden_states = self.mlp(hidden_states)
