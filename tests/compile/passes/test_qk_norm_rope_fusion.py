@@ -115,6 +115,38 @@ class QKNormRoPETestModel(torch.nn.Module):
         return [FUSED_QK_ROPE_OP]
 
 
+class MixedQKNormRoPETestModel(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        configs: list[tuple[int, int, int]],
+        eps: float,
+        is_neox: bool,
+        vllm_config: VllmConfig,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([
+            QKNormRoPETestModel(
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                eps=eps,
+                is_neox=is_neox,
+                vllm_config=vllm_config,
+                dtype=dtype,
+                prefix=f"model.layers.{idx}.self_attn.attn",
+            )
+            for idx, (num_heads, num_kv_heads, head_dim) in enumerate(configs)
+        ])
+
+    def forward(self, inputs: list[torch.Tensor], positions: torch.Tensor):
+        outputs = []
+        for layer, qkv in zip(self.layers, inputs):
+            outputs.extend(layer(qkv, positions))
+        return tuple(outputs)
+
+
 @pytest.mark.parametrize("scattered_split", [True, False])
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
 @pytest.mark.parametrize("is_neox", [True, False])
@@ -212,3 +244,86 @@ def test_qk_norm_rope_fusion(
 
         backend.check_before_ops(model.ops_in_model_before())
         backend.check_after_ops(model.ops_in_model_after())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Only test on cuda and rocm platform",
+)
+def test_qk_norm_rope_fusion_mixed_attention_signatures(dtype):
+    if not hasattr(torch.ops._C, "fused_qk_norm_rope"):
+        pytest.skip("fused_qk_norm_rope custom op not available")
+
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(0)
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=["+rms_norm", "+rotary_embedding"],
+            pass_config=PassConfig(
+                enable_qk_norm_rope_fusion=True,
+                eliminate_noops=True,
+            ),
+        ),
+    )
+
+    layer_configs = [
+        (16, 4, 128),
+        (10, 10, 256),
+    ]
+    T = 5
+
+    with (
+        set_current_vllm_config(vllm_config),
+        vllm_config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        model = MixedQKNormRoPETestModel(
+            configs=layer_configs,
+            eps=1e-6,
+            is_neox=True,
+            vllm_config=vllm_config,
+            dtype=dtype,
+        )
+
+        noop_pass = NoOpEliminationPass(vllm_config)
+        coalesce_pass = SplitCoalescingPass(vllm_config)
+        fusion_pass = QKNormRoPEFusionPass(vllm_config)
+        cleanup_pass = PostCleanupPass(vllm_config)
+
+        backend = TestBackend(noop_pass, coalesce_pass, fusion_pass, cleanup_pass)
+        backend_baseline = TestBackend(noop_pass, cleanup_pass)
+
+        inputs = [
+            torch.randn(T, num_heads * head_dim + 2 * num_kv_heads * head_dim)
+            for num_heads, num_kv_heads, head_dim in layer_configs
+        ]
+        inputs_unfused = [qkv.clone() for qkv in inputs]
+        pos = torch.arange(T, dtype=torch.long, device=inputs[0].device)
+        pos_unfused = pos.clone()
+
+        for qkv in inputs:
+            torch._dynamo.mark_dynamic(qkv, 0)
+        torch._dynamo.mark_dynamic(pos, 0)
+        model_fused = torch.compile(model, backend=backend)
+        fused_outputs = model_fused(inputs, pos)
+
+        for qkv in inputs_unfused:
+            torch._dynamo.mark_dynamic(qkv, 0)
+        torch._dynamo.mark_dynamic(pos_unfused, 0)
+        model_unfused = torch.compile(model, backend=backend_baseline)
+        unfused_outputs = model_unfused(inputs_unfused, pos_unfused)
+
+        if dtype == torch.float16:
+            ATOL, RTOL = (2e-3, 2e-3)
+        else:
+            ATOL, RTOL = (1e-2, 1e-2)
+
+        for fused, unfused in zip(fused_outputs, unfused_outputs):
+            torch.testing.assert_close(unfused, fused, atol=ATOL, rtol=RTOL)
+
+        assert fusion_pass.matched_count == len(layer_configs)
+        assert backend.op_count(FUSED_QK_ROPE_OP) == len(layer_configs)
