@@ -149,6 +149,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    AsyncSampledTokenIds,
     DraftTokenIds,
     ECConnectorOutput,
     KVConnectorOutput,
@@ -233,9 +234,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        use_shared_sampled_token_ids: bool = False,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+        self._use_shared_sampled_token_ids = use_shared_sampled_token_ids
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -259,20 +262,39 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 else None
             )
             self.async_copy_ready_event.record()
+        self.async_sampled_token_ids = (
+            AsyncSampledTokenIds(
+                self.sampled_token_ids_cpu,
+                self.async_copy_ready_event,
+            )
+            if self._use_shared_sampled_token_ids
+            else None
+        )
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
         This function blocks until the copy is finished.
         """
-        max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        if self._use_shared_sampled_token_ids:
+            assert self.async_sampled_token_ids is not None
+            sampled_token_ids_cpu = self.async_sampled_token_ids.get_cpu_tensor()
+            max_gen_len = sampled_token_ids_cpu.shape[-1]
+        else:
+            sampled_token_ids_cpu = self.sampled_token_ids_cpu
+            max_gen_len = sampled_token_ids_cpu.shape[-1]
+            self.async_copy_ready_event.synchronize()
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
         del self._sampled_token_ids
         if max_gen_len == 1:
-            valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            if self._use_shared_sampled_token_ids:
+                valid_sampled_token_ids = (
+                    self.async_sampled_token_ids.get_token_id_lists()
+                )
+            else:
+                valid_sampled_token_ids = sampled_token_ids_cpu.tolist()
             for i in self._invalid_req_indices:
                 valid_sampled_token_ids[i].clear()
             logprobs_lists = None
@@ -280,7 +302,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 logprobs_lists = self._logprobs_tensors_cpu.tolists()
         else:
             valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
-                self.sampled_token_ids_cpu,
+                sampled_token_ids_cpu,
                 self.vocab_size,
                 self._invalid_req_indices,
                 logprobs_tensors=self._logprobs_tensors_cpu,
@@ -590,6 +612,15 @@ class GPUModelRunner(
                 self.effective_drafter_max_model_len = self.max_model_len
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
+        )
+        self.use_async_output_sync_reduction = (
+            self.use_async_scheduling
+            and str(
+                self.vllm_config.additional_config.get(
+                    "gemma4_kernel_experiment", "baseline"
+                )
+            )
+            == "async-output-sync-reduction"
         )
 
         # Request states.
@@ -4338,16 +4369,23 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
                 vocab_size=self.input_batch.vocab_size,
+                use_shared_sampled_token_ids=self.use_async_output_sync_reduction,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
         ):
             # Save ref of sampled_token_ids CPU tensor if the batch contains
             # any requests with sampling params that require output ids.
-            self.input_batch.set_async_sampled_token_ids(
-                async_output.sampled_token_ids_cpu,
-                async_output.async_copy_ready_event,
-            )
+            if self.use_async_output_sync_reduction:
+                assert async_output.async_sampled_token_ids is not None
+                self.input_batch.set_async_sampled_token_ids(
+                    async_output.async_sampled_token_ids
+                )
+            else:
+                self.input_batch.set_async_sampled_token_ids(
+                    async_output.sampled_token_ids_cpu,
+                    async_output.async_copy_ready_event,
+                )
 
         return async_output
 

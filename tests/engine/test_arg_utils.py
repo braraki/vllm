@@ -220,6 +220,15 @@ def test_media_io_kwargs_parser(arg, expected):
     assert args.media_io_kwargs == expected
 
 
+def test_gemma4_async_output_sync_reduction_experiment_flag():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--gemma4-kernel-experiment", "async-output-sync-reduction"]
+    )
+
+    assert args.gemma4_kernel_experiment == "async-output-sync-reduction"
+
+
 @pytest.mark.parametrize(
     ("args", "expected"),
     [

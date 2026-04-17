@@ -655,6 +655,7 @@ class EngineArgs:
     gemma4_kernel_experiment: Literal[
         "baseline",
         "decoder-residual-fusion",
+        "async-output-sync-reduction",
         "qk-norm-rope-fusion-lt-512",
         "qk-norm-rope-fusion-512",
     ] = "baseline"
@@ -1392,6 +1393,7 @@ class EngineArgs:
             choices=[
                 "baseline",
                 "decoder-residual-fusion",
+                "async-output-sync-reduction",
                 "qk-norm-rope-fusion-lt-512",
                 "qk-norm-rope-fusion-512",
             ],
@@ -1401,6 +1403,9 @@ class EngineArgs:
                 "'baseline' keeps the existing decoder behavior, while "
                 "'decoder-residual-fusion' enables the gated decoder "
                 "residual fusion experiment. "
+                "'async-output-sync-reduction' enables the gated async "
+                "scheduling output handoff experiment to reduce duplicate "
+                "sampled-token copy synchronization. "
                 "'qk-norm-rope-fusion-lt-512' enables the fused Q/K RMSNorm + "
                 "RoPE compilation experiment only for Gemma 4 attention "
                 "signatures with supported head dimensions below 512. "

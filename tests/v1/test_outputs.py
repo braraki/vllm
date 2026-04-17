@@ -2,7 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from unittest import TestCase
 
-from vllm.v1.outputs import LogprobsLists
+import torch
+
+from vllm.v1.outputs import AsyncSampledTokenIds, LogprobsLists
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.sync_calls = 0
+
+    def synchronize(self):
+        self.sync_calls += 1
 
 
 class TestLogprobsLists(TestCase):
@@ -97,3 +107,18 @@ class TestLogprobsLists(TestCase):
         assert len(sliced.logprob_token_ids) == 9  # All tokens
         assert sliced.logprob_token_ids == self.logprobsLists.logprob_token_ids
         assert sliced.cu_num_generated_tokens is None
+
+
+class TestAsyncSampledTokenIds(TestCase):
+    def test_reuses_single_wait_and_copies_lists(self):
+        event = _FakeEvent()
+        sampled_token_ids = torch.tensor([[11, -1], [22, -1]], dtype=torch.int32)
+        async_ids = AsyncSampledTokenIds(sampled_token_ids, event)
+
+        assert async_ids.get_cpu_tensor() is sampled_token_ids
+        first_lists = async_ids.get_token_id_lists()
+        first_lists[0][0] = 999
+        second_lists = async_ids.get_token_id_lists()
+
+        assert event.sync_calls == 1
+        assert second_lists == [[11, -1], [22, -1]]

@@ -14,7 +14,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
-from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.outputs import AsyncSampledTokenIds, LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
@@ -282,6 +282,7 @@ class InputBatch:
         # These are used to update output_token_ids with real sampled
         # ids from prior step, if required by current sampling params
         # (e.g. penalties).
+        self.async_sampled_token_ids: AsyncSampledTokenIds | None = None
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
 
@@ -971,8 +972,8 @@ class InputBatch:
 
     def set_async_sampled_token_ids(
         self,
-        sampled_token_ids_cpu: torch.Tensor,
-        async_copy_ready_event: torch.Event,
+        sampled_token_ids_cpu: torch.Tensor | AsyncSampledTokenIds,
+        async_copy_ready_event: torch.Event | None = None,
     ) -> None:
         """
         In async scheduling case, store ref to sampled_token_ids_cpu
@@ -980,9 +981,16 @@ class InputBatch:
         output_token_ids prior to sampling, if needed by logits processors.
         """
         if self.sampling_metadata.output_token_ids:
-            self.sampled_token_ids_cpu = sampled_token_ids_cpu
-            self.async_copy_ready_event = async_copy_ready_event
+            if isinstance(sampled_token_ids_cpu, AsyncSampledTokenIds):
+                self.async_sampled_token_ids = sampled_token_ids_cpu
+                self.sampled_token_ids_cpu = None
+                self.async_copy_ready_event = None
+            else:
+                self.async_sampled_token_ids = None
+                self.sampled_token_ids_cpu = sampled_token_ids_cpu
+                self.async_copy_ready_event = async_copy_ready_event
         else:
+            self.async_sampled_token_ids = None
             self.sampled_token_ids_cpu = None
             self.async_copy_ready_event = None
 
@@ -993,7 +1001,13 @@ class InputBatch:
         This is called right before they are needed by the logits processors.
         """
         output_token_ids = self.sampling_metadata.output_token_ids
-        if self.sampled_token_ids_cpu is None or not output_token_ids:
+        if (
+            (
+                self.async_sampled_token_ids is None
+                and self.sampled_token_ids_cpu is None
+            )
+            or not output_token_ids
+        ):
             # Output token ids not needed or not async scheduling.
             return
 
@@ -1009,9 +1023,15 @@ class InputBatch:
                 # been discarded after a kv-load failure.
                 continue
             if sampled_token_ids is None:
-                assert self.async_copy_ready_event is not None
-                self.async_copy_ready_event.synchronize()
-                sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+                if self.async_sampled_token_ids is not None:
+                    sampled_token_ids = (
+                        self.async_sampled_token_ids.get_token_id_lists()
+                    )
+                else:
+                    assert self.async_copy_ready_event is not None
+                    assert self.sampled_token_ids_cpu is not None
+                    self.async_copy_ready_event.synchronize()
+                    sampled_token_ids = self.sampled_token_ids_cpu.tolist()
             # Replace placeholder token id(s) with actual sampled id(s).
             new_ids: list[int] = sampled_token_ids[prev_index]
             if not new_ids:
