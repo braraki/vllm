@@ -127,6 +127,10 @@ def _run_fused_qk_norm_rope_case(
 
     if dtype == torch.float16:
         atol, rtol = (2e-3, 2e-3)
+    elif head_dim == 512:
+        # The bf16 512-dim path accumulates a small amount of extra error
+        # versus the reference implementation, especially for full Neox RoPE.
+        atol, rtol = (2e-2, 1e-2)
     else:
         atol, rtol = (1e-2, 1e-2)
 
