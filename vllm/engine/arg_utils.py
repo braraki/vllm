@@ -36,6 +36,7 @@ from vllm.config import (
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
+    CompilationMode,
     ConfigType,
     DeviceConfig,
     ECTransferConfig,
