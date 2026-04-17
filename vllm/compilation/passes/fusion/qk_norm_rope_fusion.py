@@ -115,6 +115,14 @@ class QkNormRopePattern:
         view_to_reshape(gm)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        def split_qkv_if_compatible(
+            qkv: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+            expected_total = self.q_size + 2 * self.kv_size
+            if qkv.shape[-1] != expected_total:
+                return None
+            return qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
         def pattern(
             qkv: torch.Tensor,
             positions: torch.Tensor,
@@ -123,7 +131,10 @@ class QkNormRopePattern:
             cos_sin_cache: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             # split qkv -> q,k,v
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            qkv_parts = split_qkv_if_compatible(qkv)
+            if qkv_parts is None:
+                return qkv, qkv, qkv
+            q, k, v = qkv_parts
 
             # Q path: view -> RMS -> view back to q.shape
             q_by_head = q.view(
@@ -169,7 +180,9 @@ class QkNormRopePattern:
             result_qkv = result[1]
 
             # Split back to q,k,v and return
-            return result_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)  # type: ignore[no-any-return]
+            result_qkv_parts = split_qkv_if_compatible(result_qkv)
+            assert result_qkv_parts is not None
+            return result_qkv_parts  # type: ignore[no-any-return]
 
         # NOTE: use fx_view_to_reshape to unify view/reshape to simplify
         # pattern and increase matching opportunities
