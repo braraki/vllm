@@ -24,6 +24,7 @@ from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 logger = init_logger(__name__)
 
 FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS = {64, 128, 256}
 
 P = ParamSpec("P")
 
@@ -231,16 +232,38 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                 for layer in attn_layers.values()
             }
         )
+        supported_attn_signatures = [
+            signature
+            for signature in attn_signatures
+            if signature[0] in SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS
+        ]
+        skipped_attn_signatures = [
+            signature
+            for signature in attn_signatures
+            if signature[0] not in SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS
+        ]
+        if skipped_attn_signatures:
+            logger.info(
+                "QK Norm+RoPE fusion skipping unsupported attention signatures: %s",
+                skipped_attn_signatures,
+            )
+        if not supported_attn_signatures:
+            logger.warning_once(
+                "QK Norm+RoPE fusion not enabled: no attention signatures with "
+                "supported head dimensions %s",
+                sorted(SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS),
+            )
+            return
         if len(attn_signatures) > 1:
             logger.info(
                 "QK Norm+RoPE fusion registering %d attention signatures: %s",
-                len(attn_signatures),
-                attn_signatures,
+                len(supported_attn_signatures),
+                supported_attn_signatures,
             )
 
         for epsilon in [1e-5, 1e-6]:
             for neox in [True, False]:
-                for head_dim, num_heads, num_kv_heads in attn_signatures:
+                for head_dim, num_heads, num_kv_heads in supported_attn_signatures:
                     if RotaryEmbedding.enabled():
                         for rope_flashinfer in [False, True]:
                             QkNormRopePattern(

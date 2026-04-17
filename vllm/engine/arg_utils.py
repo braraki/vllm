@@ -655,7 +655,7 @@ class EngineArgs:
     gemma4_kernel_experiment: Literal[
         "baseline",
         "decoder-residual-fusion",
-        "qk-norm-rope-fusion",
+        "qk-norm-rope-fusion-lt-512",
     ] = "baseline"
 
     def __post_init__(self):
@@ -1391,7 +1391,7 @@ class EngineArgs:
             choices=[
                 "baseline",
                 "decoder-residual-fusion",
-                "qk-norm-rope-fusion",
+                "qk-norm-rope-fusion-lt-512",
             ],
             default=EngineArgs.gemma4_kernel_experiment,
             help=(
@@ -1399,8 +1399,9 @@ class EngineArgs:
                 "'baseline' keeps the existing decoder behavior, while "
                 "'decoder-residual-fusion' enables the gated decoder "
                 "residual fusion experiment. "
-                "'qk-norm-rope-fusion' enables the fused Q/K RMSNorm + "
-                "RoPE compilation experiment."
+                "'qk-norm-rope-fusion-lt-512' enables the fused Q/K RMSNorm + "
+                "RoPE compilation experiment only for Gemma 4 attention "
+                "signatures with supported head dimensions below 512."
             ),
         )
         vllm_group.add_argument(
@@ -2098,24 +2099,25 @@ class EngineArgs:
                 self.max_cudagraph_capture_size
             )
 
-        if self.gemma4_kernel_experiment == "qk-norm-rope-fusion":
+        if self.gemma4_kernel_experiment == "qk-norm-rope-fusion-lt-512":
             if compilation_config.mode not in (
                 None,
                 CompilationMode.VLLM_COMPILE,
             ):
                 raise ValueError(
-                    "gemma4_kernel_experiment='qk-norm-rope-fusion' requires "
+                    "gemma4_kernel_experiment='qk-norm-rope-fusion-lt-512' "
+                    "requires "
                     "CompilationMode.VLLM_COMPILE (or the default auto-selected "
                     "compile mode)."
                 )
             if "-rms_norm" in compilation_config.custom_ops:
                 raise ValueError(
-                    "gemma4_kernel_experiment='qk-norm-rope-fusion' is "
+                    "gemma4_kernel_experiment='qk-norm-rope-fusion-lt-512' is "
                     "incompatible with custom_ops disabling rms_norm."
                 )
             if "-rotary_embedding" in compilation_config.custom_ops:
                 raise ValueError(
-                    "gemma4_kernel_experiment='qk-norm-rope-fusion' is "
+                    "gemma4_kernel_experiment='qk-norm-rope-fusion-lt-512' is "
                     "incompatible with custom_ops disabling rotary_embedding."
                 )
 
