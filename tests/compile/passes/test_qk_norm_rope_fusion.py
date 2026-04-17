@@ -247,11 +247,20 @@ def test_qk_norm_rope_fusion(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="Only test on cuda and rocm platform",
+@pytest.mark.parametrize(
+    ("experiment_mode", "expected_matches"),
+    [
+        ("qk-norm-rope-fusion-lt-512", 1),
+        ("qk-norm-rope-fusion-512", 2),
+    ],
 )
-def test_qk_norm_rope_fusion_mixed_attention_signatures(dtype):
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Mixed-signature 512 fusion coverage is CUDA-only",
+)
+def test_qk_norm_rope_fusion_mixed_attention_signatures(
+    dtype, experiment_mode, expected_matches
+):
     if not hasattr(torch.ops._C, "fused_qk_norm_rope"):
         pytest.skip("fused_qk_norm_rope custom op not available")
 
@@ -269,6 +278,7 @@ def test_qk_norm_rope_fusion_mixed_attention_signatures(dtype):
                 eliminate_noops=True,
             ),
         ),
+        additional_config={"gemma4_kernel_experiment": experiment_mode},
     )
 
     layer_configs = [
@@ -325,5 +335,5 @@ def test_qk_norm_rope_fusion_mixed_attention_signatures(dtype):
         for fused, unfused in zip(fused_outputs, unfused_outputs):
             torch.testing.assert_close(unfused, fused, atol=ATOL, rtol=RTOL)
 
-        assert fusion_pass.matched_count == 1
-        assert backend.op_count(FUSED_QK_ROPE_OP) == 1
+        assert fusion_pass.matched_count == expected_matches
+        assert backend.op_count(FUSED_QK_ROPE_OP) == expected_matches

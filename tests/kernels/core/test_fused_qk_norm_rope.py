@@ -45,29 +45,21 @@ def _apply_qk_norm_rope(
     return torch.cat([q, k, v], dim=-1)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="fused_qk_norm_rope custom op requires cuda and rocm platform",
-)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("is_neox", IS_NEOX)
-@pytest.mark.parametrize("eps", EPS_VALUES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
-@torch.inference_mode()
-def test_fused_qk_norm_rope_matches_reference(
-    default_vllm_config,
+def _run_fused_qk_norm_rope_case(
+    *,
     device: str,
     dtype: torch.dtype,
     is_neox: bool,
     eps: float,
     seed: int,
     rotary_ratio: float,
-):
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    forced_token_heads_per_warp: int = -1,
+) -> None:
     torch.set_default_device(device)
     set_random_seed(seed)
-    num_heads, num_kv_heads, head_dim = 16, 4, 128
     num_tokens = 4
 
     total_dim = (num_heads + 2 * num_kv_heads) * head_dim
@@ -102,22 +94,21 @@ def test_fused_qk_norm_rope_matches_reference(
         head_dim=head_dim,
     )
 
-    opcheck(
-        torch.ops._C.fused_qk_norm_rope,
-        (
-            qkv_fused.clone(),
-            num_heads,
-            num_kv_heads,
-            num_kv_heads,
-            head_dim,
-            eps,
-            q_weight,
-            k_weight,
-            rope.cos_sin_cache,
-            is_neox,
-            positions.view(-1),
-        ),
+    opcheck_args = (
+        qkv_fused.clone(),
+        num_heads,
+        num_kv_heads,
+        num_kv_heads,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        rope.cos_sin_cache,
+        is_neox,
+        positions.view(-1),
+        forced_token_heads_per_warp,
     )
+    opcheck(torch.ops._C.fused_qk_norm_rope, opcheck_args)
 
     torch.ops._C.fused_qk_norm_rope(
         qkv_fused,
@@ -131,16 +122,86 @@ def test_fused_qk_norm_rope_matches_reference(
         rope.cos_sin_cache,
         is_neox,
         positions.view(-1),
+        forced_token_heads_per_warp,
     )
 
     if dtype == torch.float16:
-        ATOL, RTOL = (2e-3, 2e-3)
+        atol, rtol = (2e-3, 2e-3)
     else:
-        ATOL, RTOL = (1e-2, 1e-2)
+        atol, rtol = (1e-2, 1e-2)
 
     torch.testing.assert_close(
         qkv_fused,
         ref_result,
-        atol=ATOL,
-        rtol=RTOL,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="fused_qk_norm_rope custom op requires cuda and rocm platform",
+)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("is_neox", IS_NEOX)
+@pytest.mark.parametrize("eps", EPS_VALUES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
+@torch.inference_mode()
+def test_fused_qk_norm_rope_matches_reference(
+    default_vllm_config,
+    device: str,
+    dtype: torch.dtype,
+    is_neox: bool,
+    eps: float,
+    seed: int,
+    rotary_ratio: float,
+):
+    _run_fused_qk_norm_rope_case(
+        device=device,
+        dtype=dtype,
+        is_neox=is_neox,
+        eps=eps,
+        seed=seed,
+        rotary_ratio=rotary_ratio,
+        num_heads=16,
+        num_kv_heads=4,
+        head_dim=128,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="head_dim=512 fused_qk_norm_rope coverage is CUDA-only",
+)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("is_neox", IS_NEOX)
+@pytest.mark.parametrize("eps", EPS_VALUES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
+@pytest.mark.parametrize("forced_token_heads_per_warp", [1, 2, 4])
+@torch.inference_mode()
+def test_fused_qk_norm_rope_matches_reference_head_dim_512(
+    default_vllm_config,
+    device: str,
+    dtype: torch.dtype,
+    is_neox: bool,
+    eps: float,
+    seed: int,
+    rotary_ratio: float,
+    forced_token_heads_per_warp: int,
+):
+    _run_fused_qk_norm_rope_case(
+        device=device,
+        dtype=dtype,
+        is_neox=is_neox,
+        eps=eps,
+        seed=seed,
+        rotary_ratio=rotary_ratio,
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=512,
+        forced_token_heads_per_warp=forced_token_heads_per_warp,
     )

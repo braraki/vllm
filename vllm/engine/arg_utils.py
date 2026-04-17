@@ -656,6 +656,7 @@ class EngineArgs:
         "baseline",
         "decoder-residual-fusion",
         "qk-norm-rope-fusion-lt-512",
+        "qk-norm-rope-fusion-512",
     ] = "baseline"
 
     def __post_init__(self):
@@ -1392,6 +1393,7 @@ class EngineArgs:
                 "baseline",
                 "decoder-residual-fusion",
                 "qk-norm-rope-fusion-lt-512",
+                "qk-norm-rope-fusion-512",
             ],
             default=EngineArgs.gemma4_kernel_experiment,
             help=(
@@ -1401,7 +1403,9 @@ class EngineArgs:
                 "residual fusion experiment. "
                 "'qk-norm-rope-fusion-lt-512' enables the fused Q/K RMSNorm + "
                 "RoPE compilation experiment only for Gemma 4 attention "
-                "signatures with supported head dimensions below 512."
+                "signatures with supported head dimensions below 512. "
+                "'qk-norm-rope-fusion-512' extends that experiment to "
+                "Gemma 4 CUDA attention signatures with head_dim=512."
             ),
         )
         vllm_group.add_argument(
@@ -2099,26 +2103,36 @@ class EngineArgs:
                 self.max_cudagraph_capture_size
             )
 
-        if self.gemma4_kernel_experiment == "qk-norm-rope-fusion-lt-512":
+        if self.gemma4_kernel_experiment in (
+            "qk-norm-rope-fusion-lt-512",
+            "qk-norm-rope-fusion-512",
+        ):
+            experiment_name = f"gemma4_kernel_experiment='{self.gemma4_kernel_experiment}'"
+            if (
+                self.gemma4_kernel_experiment == "qk-norm-rope-fusion-512"
+                and not current_platform.is_cuda()
+            ):
+                raise ValueError(
+                    f"{experiment_name} is currently supported only on CUDA."
+                )
             if compilation_config.mode not in (
                 None,
                 CompilationMode.VLLM_COMPILE,
             ):
                 raise ValueError(
-                    "gemma4_kernel_experiment='qk-norm-rope-fusion-lt-512' "
-                    "requires "
+                    f"{experiment_name} requires "
                     "CompilationMode.VLLM_COMPILE (or the default auto-selected "
                     "compile mode)."
                 )
             if "-rms_norm" in compilation_config.custom_ops:
                 raise ValueError(
-                    "gemma4_kernel_experiment='qk-norm-rope-fusion-lt-512' is "
-                    "incompatible with custom_ops disabling rms_norm."
+                    f"{experiment_name} is incompatible with custom_ops "
+                    "disabling rms_norm."
                 )
             if "-rotary_embedding" in compilation_config.custom_ops:
                 raise ValueError(
-                    "gemma4_kernel_experiment='qk-norm-rope-fusion-lt-512' is "
-                    "incompatible with custom_ops disabling rotary_embedding."
+                    f"{experiment_name} is incompatible with custom_ops "
+                    "disabling rotary_embedding."
                 )
 
             compilation_config.pass_config.enable_qk_norm_rope_fusion = True

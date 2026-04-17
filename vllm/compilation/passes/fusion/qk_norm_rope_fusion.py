@@ -15,6 +15,7 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.platforms import current_platform
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
@@ -25,7 +26,8 @@ logger = init_logger(__name__)
 
 FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
 RMS_NORM_OP = torch.ops.vllm_ir.rms_norm.default
-SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS = {64, 128, 256}
+LT_512_FUSED_QK_ROPE_HEAD_DIMS = {64, 128, 256}
+CUDA_512_FUSED_QK_ROPE_HEAD_DIMS = LT_512_FUSED_QK_ROPE_HEAD_DIMS | {512}
 
 P = ParamSpec("P")
 
@@ -230,6 +232,16 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="qk_norm_rope_fusion_pass"
         )
+        experiment_mode = str(
+            config.additional_config.get("gemma4_kernel_experiment", "baseline")
+        )
+        if (
+            experiment_mode == "qk-norm-rope-fusion-512"
+            and current_platform.is_cuda()
+        ):
+            supported_head_dims = CUDA_512_FUSED_QK_ROPE_HEAD_DIMS
+        else:
+            supported_head_dims = LT_512_FUSED_QK_ROPE_HEAD_DIMS
 
         dtype = config.model_config.dtype
         if dtype not in (torch.bfloat16, torch.float16):
@@ -256,12 +268,12 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         supported_attn_signatures = [
             signature
             for signature in attn_signatures
-            if signature[0] in SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS
+            if signature[0] in supported_head_dims
         ]
         skipped_attn_signatures = [
             signature
             for signature in attn_signatures
-            if signature[0] not in SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS
+            if signature[0] not in supported_head_dims
         ]
         if skipped_attn_signatures:
             logger.info(
@@ -272,7 +284,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             logger.warning_once(
                 "QK Norm+RoPE fusion not enabled: no attention signatures with "
                 "supported head dimensions %s",
-                sorted(SUPPORTED_FUSED_QK_ROPE_HEAD_DIMS),
+                sorted(supported_head_dims),
             )
             return
         if len(attn_signatures) > 1:

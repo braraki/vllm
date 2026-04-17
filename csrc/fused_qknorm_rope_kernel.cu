@@ -72,6 +72,16 @@ struct packed_as<uint, 4> {
   using type = uint4;
 };
 
+struct alignas(32) uint8_packed {
+  uint4 lo;
+  uint4 hi;
+};
+
+template <>
+struct packed_as<uint, 8> {
+  using type = uint8_packed;
+};
+
 template <typename T>
 __inline__ __device__ T warpReduceSum(T val) {
 #pragma unroll
@@ -401,9 +411,15 @@ __global__ void fusedQKNormRopeKernelNTokenHeads(
       int const offThread = offWarp + laneId * numElemsPerThread;
       char* smem_dst =
           this_warp_head_smem + k * qkv_tile_bytes + laneId * elemSizeBytes;
-      cp_async_shared_global_ca(smem_dst,
-                                reinterpret_cast<const char*>(&qkv[offThread]),
-                                elemSizeBytes);
+      const char* glob_src = reinterpret_cast<const char*>(&qkv[offThread]);
+      if constexpr (elemSizeBytes <= 16) {
+        cp_async_shared_global_ca(smem_dst, glob_src, elemSizeBytes);
+      } else {
+        static_assert(elemSizeBytes == 32,
+                      "Only 32-byte async copies require split issuance.");
+        cp_async_shared_global_ca(smem_dst, glob_src, 16);
+        cp_async_shared_global_ca(smem_dst + 16, glob_src + 16, 16);
+      }
     }
     cp_async_commit_group();  // commit group 0 (QKV)
 
@@ -588,6 +604,14 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens,
                 k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
       });
       break;
+    case 512:
+      DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+        fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 512, INTERLEAVE>
+            <<<gridDim, blockDim, 0, stream>>>(
+                qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
+                k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+      });
+      break;
     default:
       TORCH_CHECK(false,
                   "Unsupported head dimension for fusedQKNormRope: ", head_dim);
@@ -608,6 +632,8 @@ void launchFusedQKNormRopeNTokenHeads(
                   token_heads_per_warp == 4 || token_heads_per_warp == 8,
               "token_heads_per_warp must be 1, 2, 4, or 8, got ",
               token_heads_per_warp);
+  TORCH_CHECK(head_dim != 512 || token_heads_per_warp != 8,
+              "token_heads_per_warp=8 is not supported for head_dim=512");
 
   // token_heads_per_warp == 1: delegate to the 1-head baseline kernel.
   if (token_heads_per_warp == 1) {
@@ -690,6 +716,16 @@ void launchFusedQKNormRopeNTokenHeads(
                   rotary_dim);                                               \
         });                                                                  \
         break;                                                               \
+      case 512:                                                              \
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                        \
+          fusedQKNormRopeKernelNTokenHeads<scalar_t_in, scalar_t_cache, 512, \
+                                           INTERLEAVE, (N)>                  \
+              <<<gridDim, blockDim, smem_bytes, stream>>>(                   \
+                  qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight, \
+                  k_weight, cos_sin_cache, position_ids, num_tokens,         \
+                  rotary_dim);                                               \
+        });                                                                  \
+        break;                                                               \
       default:                                                               \
         TORCH_CHECK(false, "Unsupported head dimension: ", head_dim);        \
     }                                                                        \
@@ -764,8 +800,9 @@ void fused_qk_norm_rope(
   auto stream = at::cuda::getCurrentCUDAStream(device_id);
 
   // Select token_heads_per_warp: forced value if >0, else auto-select.
-  // Auto thresholds are calibrated on SM 9.0 (H100). On other architectures,
-  // fall back to token_heads_per_warp=1 (base kernel) until profiled.
+  // Large-head auto thresholds are enabled for SM89 and SM90. Other
+  // architectures fall back to token_heads_per_warp=1 (base kernel) until
+  // profiled.
   int token_heads_per_warp;
   if (forced_token_heads_per_warp > 0) {  // only support SM80+
     token_heads_per_warp = static_cast<int>(forced_token_heads_per_warp);
@@ -774,7 +811,15 @@ void fused_qk_norm_rope(
     auto* dev_prop = at::cuda::getDeviceProperties(device_id);
     int sm_version = dev_prop->major * 10 + dev_prop->minor;
     int64_t total_qk_units = num_tokens * (num_heads_q + num_heads_k);
-    if (sm_version == 90) {
+    if (sm_version == 89 && head_dim >= 256) {
+      if (total_qk_units < 4096LL) {
+        token_heads_per_warp = 1;
+      } else if (total_qk_units < 8192LL) {
+        token_heads_per_warp = 2;
+      } else {
+        token_heads_per_warp = 4;
+      }
+    } else if (sm_version == 90) {
       if (head_dim >= 256) {
         if (total_qk_units < 4096LL) {
           token_heads_per_warp = 1;
