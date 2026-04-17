@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+from contextlib import nullcontext
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -622,7 +623,12 @@ class Gemma4DecoderLayer(nn.Module):
             if self.use_decoder_residual_fusion
             else _PRE_FF_RESIDUAL_NORM_BASELINE_SCOPE
         )
-        with record_function_or_nullcontext(pre_ff_scope):
+        scope_context = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else record_function_or_nullcontext(pre_ff_scope)
+        )
+        with scope_context:
             if self.use_decoder_residual_fusion:
                 hidden_states, residual = self.pre_feedforward_layernorm(
                     hidden_states, residual
