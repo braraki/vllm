@@ -62,18 +62,18 @@ class QkNormRopePattern:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
         self.eps = eps
         self.is_neox = is_neox
         self.rope_flashinfer = rope_flashinfer
-        self.rope_matcher = MatcherRotaryEmbedding(
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.rotary_op = MatcherRotaryEmbedding(
             is_neox=is_neox,
             head_size=self.head_dim,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             use_flashinfer=self.rope_flashinfer,
-        )
+        ).rotary_op
 
     def get_inputs(self) -> list[torch.Tensor]:
         # Sample inputs to help pattern tracing
@@ -115,14 +115,6 @@ class QkNormRopePattern:
         view_to_reshape(gm)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        def split_qkv_if_compatible(
-            qkv: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-            expected_total = self.q_size + 2 * self.kv_size
-            if qkv.shape[-1] != expected_total:
-                return None
-            return qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
         def pattern(
             qkv: torch.Tensor,
             positions: torch.Tensor,
@@ -130,28 +122,35 @@ class QkNormRopePattern:
             k_weight: torch.Tensor,
             cos_sin_cache: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            head_dim = q_weight.shape[-1]
+            kv_size = self.num_kv_heads * head_dim
+            q_size = qkv.shape[-1] - 2 * kv_size
             # split qkv -> q,k,v
-            qkv_parts = split_qkv_if_compatible(qkv)
-            if qkv_parts is None:
-                return qkv, qkv, qkv
-            q, k, v = qkv_parts
+            q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+            num_heads_q = q.shape[-1] // head_dim
 
             # Q path: view -> RMS -> view back to q.shape
-            q_by_head = q.view(
-                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
-            )
+            q_by_head = q.view(*q.shape[:-1], num_heads_q, head_dim)
             q_normed_by_head = vllm.ir.ops.rms_norm(q_by_head, q_weight, self.eps)
             q_flat = q_normed_by_head.view(q.shape)
 
             # K path: view -> RMS -> view back to k.shape
-            k_by_head = k.view(
-                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
-            )
+            k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, head_dim)
             k_normed_by_head = vllm.ir.ops.rms_norm(k_by_head, k_weight, self.eps)
             k_flat = k_normed_by_head.view(k.shape)
 
             # RoPE: apply to flattened q/k
-            q_rope, k_rope = self.rope_matcher(positions, q_flat, k_flat, cos_sin_cache)
+            result = auto_functionalized(
+                self.rotary_op,
+                positions=positions,
+                query=q_flat,
+                key=k_flat,
+                head_size=head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=self.is_neox,
+            )
+            q_rope = result[1]
+            k_rope = result[2]
             return q_rope, k_rope, v
 
         def replacement(
@@ -161,14 +160,18 @@ class QkNormRopePattern:
             k_weight: torch.Tensor,
             cos_sin_cache: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            head_dim = q_weight.shape[-1]
+            kv_size = self.num_kv_heads * head_dim
+            q_size = qkv.shape[-1] - 2 * kv_size
+            num_heads_q = q_size // head_dim
             # Run fused qk_norm_rope op
             result = auto_functionalized(
                 FUSED_QK_ROPE_OP,
                 qkv=qkv,
-                num_heads_q=self.num_heads,
+                num_heads_q=num_heads_q,
                 num_heads_k=self.num_kv_heads,
                 num_heads_v=self.num_kv_heads,
-                head_dim=self.head_dim,
+                head_dim=head_dim,
                 eps=self.eps,
                 q_weight=q_weight,
                 k_weight=k_weight,
@@ -180,9 +183,7 @@ class QkNormRopePattern:
             result_qkv = result[1]
 
             # Split back to q,k,v and return
-            result_qkv_parts = split_qkv_if_compatible(result_qkv)
-            assert result_qkv_parts is not None
-            return result_qkv_parts  # type: ignore[no-any-return]
+            return result_qkv.split([q_size, kv_size, kv_size], dim=-1)  # type: ignore[no-any-return]
 
         # NOTE: use fx_view_to_reshape to unify view/reshape to simplify
         # pattern and increase matching opportunities
