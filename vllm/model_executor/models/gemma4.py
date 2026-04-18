@@ -90,6 +90,12 @@ _PLE_GELU_AND_MUL_BASELINE_SCOPE = "gemma4.decoder.ple_gelu_and_mul:baseline"
 _PLE_GELU_AND_MUL_FUSION_SCOPE = (
     "gemma4.decoder.ple_gelu_and_mul:ple_gelu_and_mul_fusion"
 )
+_ATTENTION_PREP_BASELINE_SCOPE = "gemma4.attention.prep:baseline"
+_ATTENTION_PREP_QK_LT_512_SCOPE = "gemma4.attention.prep:qk_norm_rope_fusion_lt_512"
+_ATTENTION_PREP_QK_512_SCOPE = "gemma4.attention.prep:qk_norm_rope_fusion_512"
+_ATTENTION_PREP_QKV_VNORM_SCOPE = (
+    "gemma4.attention.prep:qkv_norm_rope_vnorm_fusion"
+)
 
 
 def _get_text_config(config):
@@ -281,12 +287,14 @@ class Gemma4Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         attn_logits_soft_cap: float | None = None,
+        kernel_experiment: str = "baseline",
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size
         self.use_k_eq_v = use_k_eq_v
+        self.kernel_experiment = kernel_experiment
 
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -405,6 +413,15 @@ class Gemma4Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+    def _attention_prep_scope(self) -> str:
+        if self.kernel_experiment == "qk-norm-rope-fusion-lt-512":
+            return _ATTENTION_PREP_QK_LT_512_SCOPE
+        if self.kernel_experiment == "qk-norm-rope-fusion-512":
+            return _ATTENTION_PREP_QK_512_SCOPE
+        if self.kernel_experiment == "qkv-norm-rope-vnorm-fusion":
+            return _ATTENTION_PREP_QKV_VNORM_SCOPE
+        return _ATTENTION_PREP_BASELINE_SCOPE
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -416,25 +433,30 @@ class Gemma4Attention(nn.Module):
         # qkv_proj, so V == K automatically.
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        scope_context = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else record_function_or_nullcontext(self._attention_prep_scope())
+        )
+        with scope_context:
+            # Q norm (always applied)
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
 
-        # Q norm (always applied)
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
+            if not self.is_kv_shared_layer:
+                # Non-shared: apply K norm + RoPE, V norm
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
 
-        if not self.is_kv_shared_layer:
-            # Non-shared: apply K norm + RoPE, V norm
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
-        else:
-            # Shared: only apply RoPE to Q
-            q = self.rotary_emb(positions, q, k)[0]
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+            else:
+                # Shared: only apply RoPE to Q
+                q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -500,6 +522,7 @@ class Gemma4DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
+            kernel_experiment=kernel_experiment,
             prefix=f"{prefix}.self_attn",
         )
 

@@ -659,6 +659,7 @@ class EngineArgs:
         "async-output-sync-reduction",
         "qk-norm-rope-fusion-lt-512",
         "qk-norm-rope-fusion-512",
+        "qkv-norm-rope-vnorm-fusion",
     ] = "baseline"
 
     def __post_init__(self):
@@ -1398,6 +1399,7 @@ class EngineArgs:
                 "async-output-sync-reduction",
                 "qk-norm-rope-fusion-lt-512",
                 "qk-norm-rope-fusion-512",
+                "qkv-norm-rope-vnorm-fusion",
             ],
             default=EngineArgs.gemma4_kernel_experiment,
             help=(
@@ -1414,7 +1416,11 @@ class EngineArgs:
                 "RoPE compilation experiment only for Gemma 4 attention "
                 "signatures with supported head dimensions below 512. "
                 "'qk-norm-rope-fusion-512' extends that experiment to "
-                "Gemma 4 CUDA attention signatures with head_dim=512."
+                "Gemma 4 CUDA attention signatures with head_dim=512. "
+                "'qkv-norm-rope-vnorm-fusion' enables the Gemma 4 CUDA "
+                "attention-prep compilation experiment that fuses Q/K "
+                "RMSNorm + RoPE together with weightless V RMSNorm on "
+                "non-KV-shared layers."
             ),
         )
         vllm_group.add_argument(
@@ -2115,10 +2121,15 @@ class EngineArgs:
         if self.gemma4_kernel_experiment in (
             "qk-norm-rope-fusion-lt-512",
             "qk-norm-rope-fusion-512",
+            "qkv-norm-rope-vnorm-fusion",
         ):
             experiment_name = f"gemma4_kernel_experiment='{self.gemma4_kernel_experiment}'"
             if (
-                self.gemma4_kernel_experiment == "qk-norm-rope-fusion-512"
+                self.gemma4_kernel_experiment
+                in (
+                    "qk-norm-rope-fusion-512",
+                    "qkv-norm-rope-vnorm-fusion",
+                )
                 and not current_platform.is_cuda()
             ):
                 raise ValueError(

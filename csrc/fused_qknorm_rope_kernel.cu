@@ -741,6 +741,579 @@ void launchFusedQKNormRopeNTokenHeads(
 #undef LAUNCH_N_TOKEN_HEADS
 }
 
+template <typename scalar_t_in, typename scalar_t_cache, int head_dim,
+          bool interleave>
+__global__ void fusedQKVNormRopeVNormKernel(
+    void* qkv_void, int const num_heads_q, int const num_heads_k,
+    int const num_heads_v, float const eps, void const* q_weight_void,
+    void const* k_weight_void, void const* cos_sin_cache_void,
+    int64_t const* position_ids, int const num_tokens, int const rotary_dim) {
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  if constexpr ((std::is_same_v<scalar_t_in, c10::BFloat16>) ||
+                std::is_same_v<scalar_t_cache, c10::BFloat16>) {
+    return;
+  } else {
+#endif
+
+    using Converter = vllm::_typeConvert<scalar_t_in>;
+    static_assert(Converter::exists,
+                  "Input QKV data type is not supported for this CUDA "
+                  "architecture or toolkit version.");
+    using T_in = typename Converter::hip_type;
+    using T2_in = typename Converter::packed_hip_type;
+
+    using CacheConverter = vllm::_typeConvert<scalar_t_cache>;
+    static_assert(CacheConverter::exists,
+                  "Cache data type is not supported for this CUDA architecture "
+                  "or toolkit version.");
+    using T_cache = typename CacheConverter::hip_type;
+
+    T_in* qkv = reinterpret_cast<T_in*>(qkv_void);
+    T_in const* q_weight = reinterpret_cast<T_in const*>(q_weight_void);
+    T_in const* k_weight = reinterpret_cast<T_in const*>(k_weight_void);
+    T_cache const* cos_sin_cache =
+        reinterpret_cast<T_cache const*>(cos_sin_cache_void);
+
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+
+    int const total_qkv_heads = num_heads_q + num_heads_k + num_heads_v;
+    int const tokenIdx = globalWarpIdx / total_qkv_heads;
+    int const localHeadIdx = globalWarpIdx % total_qkv_heads;
+
+    if (tokenIdx >= num_tokens) return;
+
+    bool const isQ = localHeadIdx < num_heads_q;
+    bool const isK = !isQ && localHeadIdx < (num_heads_q + num_heads_k);
+    bool const isV = !isQ && !isK;
+    int const headIdx = isQ ? localHeadIdx
+                            : (isK ? localHeadIdx - num_heads_q
+                                   : localHeadIdx - num_heads_q - num_heads_k);
+    int const num_heads = total_qkv_heads;
+
+    static_assert(head_dim % (32 * 2) == 0,
+                  "head_dim must be divisible by 64");
+    constexpr int numElemsPerThread = head_dim / 32;
+    float elements[numElemsPerThread];
+    float elements2[numElemsPerThread];
+    constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
+    static_assert(elemSizeBytes % 4 == 0,
+                  "numSizeBytes must be a multiple of 4");
+    constexpr int vecSize = elemSizeBytes / 4;
+    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+
+    int offsetWarp;
+    if (isQ) {
+      offsetWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
+    } else if (isK) {
+      offsetWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim +
+                   headIdx * head_dim;
+    } else {
+      offsetWarp =
+          tokenIdx * num_heads * head_dim +
+          (num_heads_q + num_heads_k) * head_dim + headIdx * head_dim;
+    }
+    int offsetThread = offsetWarp + laneId * numElemsPerThread;
+
+    float sumOfSquares = 0.0f;
+    {
+      vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
+      constexpr int num_packed_elems = elemSizeBytes / sizeof(T2_in);
+#pragma unroll
+      for (int i = 0; i < num_packed_elems; i++) {
+        T2_in packed_val = *(reinterpret_cast<T2_in*>(&vec) + i);
+        float2 vals = Converter::convert(packed_val);
+        sumOfSquares += vals.x * vals.x;
+        sumOfSquares += vals.y * vals.y;
+        elements[2 * i] = vals.x;
+        elements[2 * i + 1] = vals.y;
+      }
+    }
+
+    sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
+    float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+
+#pragma unroll
+    for (int i = 0; i < numElemsPerThread; i++) {
+      int const dim = laneId * numElemsPerThread + i;
+      if (isQ) {
+        elements[i] *= rms_rcp * Converter::convert(q_weight[dim]);
+      } else if (isK) {
+        elements[i] *= rms_rcp * Converter::convert(k_weight[dim]);
+      } else {
+        elements[i] *= rms_rcp;
+      }
+    }
+
+    if (!isV) {
+      int64_t const pos_id = position_ids[tokenIdx];
+      T_cache const* const cache_ptr = cos_sin_cache + pos_id * rotary_dim;
+      int const embed_dim = rotary_dim / 2;
+      T_cache const* const cos_ptr = cache_ptr;
+      T_cache const* const sin_ptr = cache_ptr + embed_dim;
+      int const rotary_lanes = rotary_dim / numElemsPerThread;
+      if (laneId < rotary_lanes) {
+        if constexpr (interleave) {
+#pragma unroll
+          for (int i = 0; i < numElemsPerThread / 2; ++i) {
+            int const idx0 = 2 * i;
+            int const idx1 = 2 * i + 1;
+            int const dim_idx = laneId * numElemsPerThread + idx0;
+            float const val0 = elements[idx0];
+            float const val1 = elements[idx1];
+            int const half_dim = dim_idx / 2;
+            float const cos_val =
+                CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
+            float const sin_val =
+                CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
+            elements[idx0] = val0 * cos_val - val1 * sin_val;
+            elements[idx1] = val0 * sin_val + val1 * cos_val;
+          }
+        } else {
+          __syncwarp();
+          int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
+#pragma unroll
+          for (int i = 0; i < numElemsPerThread; i++) {
+            elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);
+            if (laneId < pairOffset) {
+              elements2[i] = -elements2[i];
+            }
+            int dim_idx = laneId * numElemsPerThread + i;
+            dim_idx = (dim_idx * 2) % rotary_dim;
+            int const half_dim = dim_idx / 2;
+            float const cos_val =
+                CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
+            float const sin_val =
+                CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
+            elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
+          }
+          __syncwarp();
+        }
+      }
+    }
+
+    {
+      vec_T vec;
+      constexpr int num_packed_elems = elemSizeBytes / sizeof(T2_in);
+#pragma unroll
+      for (int i = 0; i < num_packed_elems; i++) {
+        T2_in packed_val = Converter::convert(
+            make_float2(elements[2 * i], elements[2 * i + 1]));
+        *(reinterpret_cast<T2_in*>(&vec) + i) = packed_val;
+      }
+      *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = vec;
+    }
+
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  }
+#endif
+}
+
+template <typename scalar_t_in, typename scalar_t_cache, int head_dim,
+          bool interleave, int HEADS_PER_WARP>
+__global__ void fusedQKVNormRopeVNormKernelNTokenHeads(
+    void* qkv_void, int const num_heads_q, int const num_heads_k,
+    int const num_heads_v, float const eps, void const* q_weight_void,
+    void const* k_weight_void, void const* cos_sin_cache_void,
+    int64_t const* position_ids, int const num_tokens, int const rotary_dim) {
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  if constexpr ((std::is_same_v<scalar_t_in, c10::BFloat16>) ||
+                std::is_same_v<scalar_t_cache, c10::BFloat16>) {
+    return;
+  } else {
+#endif
+
+    using Converter = vllm::_typeConvert<scalar_t_in>;
+    static_assert(Converter::exists,
+                  "Input QKV data type is not supported for this CUDA "
+                  "architecture or toolkit version.");
+    using T_in = typename Converter::hip_type;
+    using T2_in = typename Converter::packed_hip_type;
+
+    using CacheConverter = vllm::_typeConvert<scalar_t_cache>;
+    static_assert(CacheConverter::exists,
+                  "Cache data type is not supported for this CUDA architecture "
+                  "or toolkit version.");
+    using T_cache = typename CacheConverter::hip_type;
+
+    extern __shared__ char smem_storage[];
+    T_cache* const smem = reinterpret_cast<T_cache*>(smem_storage);
+
+    T_in* qkv = reinterpret_cast<T_in*>(qkv_void);
+    T_in const* q_weight = reinterpret_cast<T_in const*>(q_weight_void);
+    T_in const* k_weight = reinterpret_cast<T_in const*>(k_weight_void);
+    T_cache const* cos_sin_cache =
+        reinterpret_cast<T_cache const*>(cos_sin_cache_void);
+
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const total_qkv_heads = num_heads_q + num_heads_k + num_heads_v;
+    int const num_heads = total_qkv_heads;
+    int const head_chunks_per_token =
+        (total_qkv_heads + HEADS_PER_WARP - 1) / HEADS_PER_WARP;
+
+    int const warp_global = blockIdx.x * warpsPerBlock + warpId;
+    int const tokenIdx = warp_global / head_chunks_per_token;
+    int const headChunk = warp_global % head_chunks_per_token;
+    int const first_head = headChunk * HEADS_PER_WARP;
+    int const num_heads_this_warp =
+        (first_head + HEADS_PER_WARP <= total_qkv_heads)
+            ? HEADS_PER_WARP
+            : (total_qkv_heads - first_head);
+
+    if (tokenIdx >= num_tokens) return;
+
+    static_assert(head_dim % (32 * 2) == 0, "head_dim must be divisible by 64");
+    constexpr int numElemsPerThread = head_dim / 32;
+    constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
+    static_assert(elemSizeBytes % 4 == 0,
+                  "elemSizeBytes must be a multiple of 4");
+    constexpr int vecSize = elemSizeBytes / 4;
+    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+
+    int const cos_sin_bytes =
+        warpsPerBlock * rotary_dim * static_cast<int>(sizeof(T_cache));
+    int const qkv_tile_bytes = 32 * elemSizeBytes;
+    char* const this_warp_head_smem =
+        smem_storage + cos_sin_bytes +
+        warpId * (HEADS_PER_WARP * qkv_tile_bytes);
+
+    for (int k = 0; k < num_heads_this_warp; ++k) {
+      int const localHeadIdx = first_head + k;
+      bool const isQ = localHeadIdx < num_heads_q;
+      bool const isK = !isQ && localHeadIdx < (num_heads_q + num_heads_k);
+      int const headIdx = isQ ? localHeadIdx
+                              : (isK ? localHeadIdx - num_heads_q
+                                     : localHeadIdx - num_heads_q - num_heads_k);
+      int offWarp;
+      if (isQ) {
+        offWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
+      } else if (isK) {
+        offWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim +
+                  headIdx * head_dim;
+      } else {
+        offWarp = tokenIdx * num_heads * head_dim +
+                  (num_heads_q + num_heads_k) * head_dim + headIdx * head_dim;
+      }
+      int const offThread = offWarp + laneId * numElemsPerThread;
+      char* smem_dst =
+          this_warp_head_smem + k * qkv_tile_bytes + laneId * elemSizeBytes;
+      const char* glob_src = reinterpret_cast<const char*>(&qkv[offThread]);
+      if constexpr (elemSizeBytes <= 16) {
+        cp_async_shared_global_ca(smem_dst, glob_src, elemSizeBytes);
+      } else {
+        static_assert(elemSizeBytes == 32,
+                      "Only 32-byte async copies require split issuance.");
+        cp_async_shared_global_ca(smem_dst, glob_src, 16);
+        cp_async_shared_global_ca(smem_dst + 16, glob_src + 16, 16);
+      }
+    }
+    cp_async_commit_group();
+
+    int64_t const pos_id = position_ids[tokenIdx];
+    T_cache const* const cache_ptr = cos_sin_cache + pos_id * rotary_dim;
+    int const copy_bytes = rotary_dim * static_cast<int>(sizeof(T_cache));
+    int const num_copies = (copy_bytes + 15) / 16;
+    for (int copyId = laneId; copyId < num_copies; copyId += 32) {
+      char* smem_ptr =
+          reinterpret_cast<char*>(&smem[warpId * rotary_dim]) + copyId * 16;
+      const char* glob_ptr =
+          reinterpret_cast<const char*>(cache_ptr) + copyId * 16;
+      cp_async_shared_global_16_cg(smem_ptr, glob_ptr);
+    }
+    cp_async_commit_group();
+
+    cp_async_wait_group<1>();
+
+    float elements[numElemsPerThread];
+    float elements2[numElemsPerThread];
+    int const rotary_lanes = rotary_dim / numElemsPerThread;
+    int const embed_dim = rotary_dim / 2;
+    T_cache const* const cos_smem = &smem[warpId * rotary_dim];
+    T_cache const* const sin_smem = &smem[warpId * rotary_dim + embed_dim];
+
+    float q_w[numElemsPerThread];
+    float k_w[numElemsPerThread];
+#pragma unroll
+    for (int i = 0; i < numElemsPerThread; i++) {
+      int const dim = laneId * numElemsPerThread + i;
+      q_w[i] = Converter::convert(q_weight[dim]);
+      k_w[i] = Converter::convert(k_weight[dim]);
+    }
+
+    for (int k = 0; k < num_heads_this_warp; ++k) {
+      int const localHeadIdx = first_head + k;
+      bool const isQ = localHeadIdx < num_heads_q;
+      bool const isK = !isQ && localHeadIdx < (num_heads_q + num_heads_k);
+      bool const isV = !isQ && !isK;
+      int const headIdx = isQ ? localHeadIdx
+                              : (isK ? localHeadIdx - num_heads_q
+                                     : localHeadIdx - num_heads_q - num_heads_k);
+
+      int offsetWarp;
+      if (isQ) {
+        offsetWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
+      } else if (isK) {
+        offsetWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim +
+                     headIdx * head_dim;
+      } else {
+        offsetWarp = tokenIdx * num_heads * head_dim +
+                     (num_heads_q + num_heads_k) * head_dim + headIdx * head_dim;
+      }
+      int const offsetThread = offsetWarp + laneId * numElemsPerThread;
+
+      float sumOfSquares = 0.0f;
+      {
+        char const* smem_src =
+            this_warp_head_smem + k * qkv_tile_bytes + laneId * elemSizeBytes;
+        vec_T vec = *reinterpret_cast<vec_T const*>(smem_src);
+        constexpr int num_packed_elems = elemSizeBytes / sizeof(T2_in);
+#pragma unroll
+        for (int i = 0; i < num_packed_elems; i++) {
+          T2_in packed_val = *(reinterpret_cast<T2_in*>(&vec) + i);
+          float2 vals = Converter::convert(packed_val);
+          sumOfSquares += vals.x * vals.x;
+          sumOfSquares += vals.y * vals.y;
+          elements[2 * i] = vals.x;
+          elements[2 * i + 1] = vals.y;
+        }
+      }
+
+      sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
+      float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+
+#pragma unroll
+      for (int i = 0; i < numElemsPerThread; i++) {
+        if (isQ) {
+          elements[i] *= rms_rcp * q_w[i];
+        } else if (isK) {
+          elements[i] *= rms_rcp * k_w[i];
+        } else {
+          elements[i] *= rms_rcp;
+        }
+      }
+
+      if (k == 0) cp_async_wait_group<0>();
+
+      if (!isV && laneId < rotary_lanes) {
+        if constexpr (interleave) {
+#pragma unroll
+          for (int i = 0; i < numElemsPerThread / 2; ++i) {
+            int const idx0 = 2 * i;
+            int const idx1 = 2 * i + 1;
+            int const dim_idx = laneId * numElemsPerThread + idx0;
+            float const val0 = elements[idx0];
+            float const val1 = elements[idx1];
+            int const half_dim = dim_idx / 2;
+            float const cos_val = CacheConverter::convert(cos_smem[half_dim]);
+            float const sin_val = CacheConverter::convert(sin_smem[half_dim]);
+            elements[idx0] = val0 * cos_val - val1 * sin_val;
+            elements[idx1] = val0 * sin_val + val1 * cos_val;
+          }
+        } else {
+          __syncwarp();
+          int const pairOffset = (rotary_dim / 2) / numElemsPerThread;
+#pragma unroll
+          for (int i = 0; i < numElemsPerThread; i++) {
+            elements2[i] = __shfl_xor_sync(FINAL_MASK, elements[i], pairOffset);
+            if (laneId < pairOffset) elements2[i] = -elements2[i];
+            int dim_idx = laneId * numElemsPerThread + i;
+            dim_idx = (dim_idx * 2) % rotary_dim;
+            int const half_dim = dim_idx / 2;
+            float const cos_val = CacheConverter::convert(cos_smem[half_dim]);
+            float const sin_val = CacheConverter::convert(sin_smem[half_dim]);
+            elements[i] = elements[i] * cos_val + elements2[i] * sin_val;
+          }
+          __syncwarp();
+        }
+      }
+
+      {
+        vec_T vec;
+        constexpr int num_packed_elems = elemSizeBytes / sizeof(T2_in);
+#pragma unroll
+        for (int i = 0; i < num_packed_elems; i++) {
+          T2_in packed_val = Converter::convert(
+              make_float2(elements[2 * i], elements[2 * i + 1]));
+          *(reinterpret_cast<T2_in*>(&vec) + i) = packed_val;
+        }
+        *reinterpret_cast<vec_T*>(&qkv[offsetThread]) = vec;
+      }
+    }
+
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  }
+#endif
+}
+
+template <typename scalar_t_in, typename scalar_t_cache>
+void launchFusedQKVNormRopeVNorm(
+    void* qkv, int const num_tokens, int const num_heads_q,
+    int const num_heads_k, int const num_heads_v, int const head_dim,
+    int const rotary_dim, float const eps, void const* q_weight,
+    void const* k_weight, void const* cos_sin_cache, bool const interleave,
+    int64_t const* position_ids, cudaStream_t stream) {
+  constexpr int blockSize = 256;
+  int const warpsPerBlock = blockSize / 32;
+  int const totalQKVHeads = num_heads_q + num_heads_k + num_heads_v;
+  int const totalWarps = num_tokens * totalQKVHeads;
+  int const gridSize = common::divUp(totalWarps, warpsPerBlock);
+  dim3 gridDim(gridSize);
+  dim3 blockDim(blockSize);
+  switch (head_dim) {
+    case 64:
+      DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+        fusedQKVNormRopeVNormKernel<scalar_t_in, scalar_t_cache, 64, INTERLEAVE>
+            <<<gridDim, blockDim, 0, stream>>>(
+                qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
+                k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+      });
+      break;
+    case 128:
+      DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+        fusedQKVNormRopeVNormKernel<scalar_t_in, scalar_t_cache, 128,
+                                    INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
+            qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
+            k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+      });
+      break;
+    case 256:
+      DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+        fusedQKVNormRopeVNormKernel<scalar_t_in, scalar_t_cache, 256,
+                                    INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
+            qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
+            k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+      });
+      break;
+    case 512:
+      DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+        fusedQKVNormRopeVNormKernel<scalar_t_in, scalar_t_cache, 512,
+                                    INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
+            qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
+            k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+      });
+      break;
+    default:
+      TORCH_CHECK(false,
+                  "Unsupported head dimension for fusedQKVNormRopeVNorm: ",
+                  head_dim);
+  }
+}
+
+template <typename scalar_t_in, typename scalar_t_cache>
+void launchFusedQKVNormRopeVNormNTokenHeads(
+    void* qkv, int const num_tokens, int const num_heads_q,
+    int const num_heads_k, int const num_heads_v, int const head_dim,
+    int const rotary_dim, float const eps, void const* q_weight,
+    void const* k_weight, void const* cos_sin_cache, bool const interleave,
+    int64_t const* position_ids, int const token_heads_per_warp,
+    cudaStream_t stream) {
+  TORCH_CHECK(token_heads_per_warp == 1 || token_heads_per_warp == 2 ||
+                  token_heads_per_warp == 4 || token_heads_per_warp == 8,
+              "token_heads_per_warp must be 1, 2, 4, or 8, got ",
+              token_heads_per_warp);
+  TORCH_CHECK(head_dim != 512 || token_heads_per_warp != 8,
+              "token_heads_per_warp=8 is not supported for head_dim=512");
+
+  if (token_heads_per_warp == 1) {
+    launchFusedQKVNormRopeVNorm<scalar_t_in, scalar_t_cache>(
+        qkv, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
+        rotary_dim, eps, q_weight, k_weight, cos_sin_cache, interleave,
+        position_ids, stream);
+    return;
+  }
+
+  {
+    size_t const rotary_bytes =
+        static_cast<size_t>(rotary_dim) *
+        (std::is_same_v<scalar_t_cache, float> ? sizeof(float) : 2u);
+    if (rotary_bytes % 16 != 0) {
+      launchFusedQKVNormRopeVNorm<scalar_t_in, scalar_t_cache>(
+          qkv, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
+          rotary_dim, eps, q_weight, k_weight, cos_sin_cache, interleave,
+          position_ids, stream);
+      return;
+    }
+  }
+
+  constexpr int blockSize = 256;
+  int const warpsPerBlock = blockSize / 32;
+  int const totalQKVHeads = num_heads_q + num_heads_k + num_heads_v;
+  int const head_chunks_per_token =
+      (totalQKVHeads + token_heads_per_warp - 1) / token_heads_per_warp;
+  int const total_warps = num_tokens * head_chunks_per_token;
+  int const gridSize = common::divUp(total_warps, warpsPerBlock);
+  dim3 gridDim(gridSize);
+  dim3 blockDim(blockSize);
+  size_t const cache_elem_size =
+      std::is_same_v<scalar_t_cache, float> ? sizeof(float) : 2u;
+  size_t const qkv_smem_per_warp = static_cast<size_t>(token_heads_per_warp) *
+                                   2u * static_cast<size_t>(head_dim);
+  size_t const smem_bytes =
+      warpsPerBlock * static_cast<size_t>(rotary_dim) * cache_elem_size +
+      warpsPerBlock * qkv_smem_per_warp;
+
+#define LAUNCH_QKV_N_TOKEN_HEADS(N)                                            \
+  do {                                                                         \
+    switch (head_dim) {                                                        \
+      case 64:                                                                 \
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                          \
+          fusedQKVNormRopeVNormKernelNTokenHeads<scalar_t_in, scalar_t_cache,  \
+                                                 64, INTERLEAVE, (N)>          \
+              <<<gridDim, blockDim, smem_bytes, stream>>>(                     \
+                  qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,   \
+                  k_weight, cos_sin_cache, position_ids, num_tokens,           \
+                  rotary_dim);                                                 \
+        });                                                                    \
+        break;                                                                 \
+      case 128:                                                                \
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                          \
+          fusedQKVNormRopeVNormKernelNTokenHeads<scalar_t_in, scalar_t_cache,  \
+                                                 128, INTERLEAVE, (N)>         \
+              <<<gridDim, blockDim, smem_bytes, stream>>>(                     \
+                  qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,   \
+                  k_weight, cos_sin_cache, position_ids, num_tokens,           \
+                  rotary_dim);                                                 \
+        });                                                                    \
+        break;                                                                 \
+      case 256:                                                                \
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                          \
+          fusedQKVNormRopeVNormKernelNTokenHeads<scalar_t_in, scalar_t_cache,  \
+                                                 256, INTERLEAVE, (N)>         \
+              <<<gridDim, blockDim, smem_bytes, stream>>>(                     \
+                  qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,   \
+                  k_weight, cos_sin_cache, position_ids, num_tokens,           \
+                  rotary_dim);                                                 \
+        });                                                                    \
+        break;                                                                 \
+      case 512:                                                                \
+        DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {                          \
+          fusedQKVNormRopeVNormKernelNTokenHeads<scalar_t_in, scalar_t_cache,  \
+                                                 512, INTERLEAVE, (N)>         \
+              <<<gridDim, blockDim, smem_bytes, stream>>>(                     \
+                  qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,   \
+                  k_weight, cos_sin_cache, position_ids, num_tokens,           \
+                  rotary_dim);                                                 \
+        });                                                                    \
+        break;                                                                 \
+      default:                                                                 \
+        TORCH_CHECK(false, "Unsupported head dimension: ", head_dim);          \
+    }                                                                          \
+  } while (0)
+
+  if (token_heads_per_warp == 2) {
+    LAUNCH_QKV_N_TOKEN_HEADS(2);
+  } else if (token_heads_per_warp == 4) {
+    LAUNCH_QKV_N_TOKEN_HEADS(4);
+  } else if (token_heads_per_warp == 8) {
+    LAUNCH_QKV_N_TOKEN_HEADS(8);
+  }
+#undef LAUNCH_QKV_N_TOKEN_HEADS
+}
+
 }  // namespace tensorrt_llm::kernels
 
 void fused_qk_norm_rope(
@@ -857,4 +1430,115 @@ void fused_qk_norm_rope(
               token_heads_per_warp, stream);
         });
   });
+}
+
+void fused_qkv_norm_rope_vnorm(
+    torch::Tensor& qkv, int64_t num_heads_q, int64_t num_heads_k,
+    int64_t num_heads_v, int64_t head_dim, double eps,
+    torch::Tensor& q_weight, torch::Tensor& k_weight,
+    torch::Tensor& cos_sin_cache, bool is_neox, torch::Tensor& position_ids,
+    int64_t forced_token_heads_per_warp) {
+  CHECK_INPUT(qkv);
+  CHECK_INPUT(position_ids);
+  CHECK_INPUT(q_weight);
+  CHECK_INPUT(k_weight);
+  CHECK_INPUT(cos_sin_cache);
+  CHECK_TYPE(position_ids, torch::kInt64);
+
+  TORCH_CHECK(qkv.dim() == 2,
+              "QKV tensor must be 2D: [num_tokens, "
+              "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
+  TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+  TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
+  TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
+  TORCH_CHECK(cos_sin_cache.dim() == 2,
+              "Cos/sin cache must be 2D: [max_position, head_dim]");
+  TORCH_CHECK(q_weight.size(0) == head_dim,
+              "Query weights size must match head dimension");
+  TORCH_CHECK(k_weight.size(0) == head_dim,
+              "Key weights size must match head dimension");
+  TORCH_CHECK(cos_sin_cache.size(1) % 2 == 0, "rotary_dim must be even");
+  TORCH_CHECK(cos_sin_cache.size(1) <= head_dim,
+              "rotary_dim must be less than or equal to head_dim");
+  TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
+                  qkv.scalar_type() == k_weight.scalar_type(),
+              "qkv, q_weight and k_weight must have the same dtype");
+
+  int64_t num_tokens = qkv.size(0);
+  TORCH_CHECK(position_ids.size(0) == num_tokens,
+              "Number of tokens in position_ids must match QKV");
+
+  int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
+  TORCH_CHECK(
+      qkv.size(1) == total_heads * head_dim,
+      "QKV tensor size must match total number of heads and head dimension");
+
+  auto device_id = qkv.get_device();
+  auto stream = at::cuda::getCurrentCUDAStream(device_id);
+
+  int token_heads_per_warp;
+  if (forced_token_heads_per_warp > 0) {
+    token_heads_per_warp = static_cast<int>(forced_token_heads_per_warp);
+  } else {
+    token_heads_per_warp = 1;
+    auto* dev_prop = at::cuda::getDeviceProperties(device_id);
+    int sm_version = dev_prop->major * 10 + dev_prop->minor;
+    int64_t total_qkv_units =
+        num_tokens * (num_heads_q + num_heads_k + num_heads_v);
+    if (sm_version == 89 && head_dim >= 256) {
+      if (total_qkv_units < 4096LL) {
+        token_heads_per_warp = 1;
+      } else if (total_qkv_units < 8192LL) {
+        token_heads_per_warp = 2;
+      } else {
+        token_heads_per_warp = 4;
+      }
+    } else if (sm_version == 90) {
+      if (head_dim >= 256) {
+        if (total_qkv_units < 4096LL) {
+          token_heads_per_warp = 1;
+        } else if (total_qkv_units < 8192LL) {
+          token_heads_per_warp = 2;
+        } else {
+          token_heads_per_warp = 4;
+        }
+      } else {
+        if (total_qkv_units < 10240LL) {
+          token_heads_per_warp = 1;
+        } else if (total_qkv_units < 40960LL) {
+          token_heads_per_warp = 4;
+        } else {
+          token_heads_per_warp = 8;
+        }
+      }
+    }
+  }
+
+  VLLM_DISPATCH_HALF_TYPES(qkv.scalar_type(),
+                           "fused_qkv_norm_rope_vnorm_kernel", [&] {
+                             using qkv_scalar_t = scalar_t;
+                             VLLM_DISPATCH_FLOATING_TYPES(
+                                 cos_sin_cache.scalar_type(),
+                                 "fused_qkv_norm_rope_vnorm_kernel", [&] {
+                                   using cache_scalar_t = scalar_t;
+                                   tensorrt_llm::kernels::
+                                       launchFusedQKVNormRopeVNormNTokenHeads<
+                                           qkv_scalar_t, cache_scalar_t>(
+                                           qkv.data_ptr(),
+                                           static_cast<int>(num_tokens),
+                                           static_cast<int>(num_heads_q),
+                                           static_cast<int>(num_heads_k),
+                                           static_cast<int>(num_heads_v),
+                                           static_cast<int>(head_dim),
+                                           static_cast<int>(
+                                               cos_sin_cache.size(1)),
+                                           static_cast<float>(eps),
+                                           q_weight.data_ptr(),
+                                           k_weight.data_ptr(),
+                                           cos_sin_cache.data_ptr(), !is_neox,
+                                           reinterpret_cast<int64_t const*>(
+                                               position_ids.data_ptr()),
+                                           token_heads_per_warp, stream);
+                                 });
+                           });
 }
