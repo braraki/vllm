@@ -42,6 +42,7 @@ DEFAULT_NUM_TOKENS = [1, 4, 16, 64, 256, 1024]
 DEFAULT_PROVIDERS = [
     "baseline_eager",
     "baseline_compiled",
+    "fusion_compiled",
     "fusion_custom_op",
 ]
 
@@ -141,6 +142,9 @@ def run_provider(
     if provider == "baseline_compiled":
         compiled_fn = torch.compile(baseline_residual_rmsnorm)
         return compiled_fn(hidden_states, residual, weight, eps)
+    if provider == "fusion_compiled":
+        compiled_fn = torch.compile(fusion_residual_rmsnorm)
+        return compiled_fn(hidden_states, residual, weight, eps)
     if provider == "fusion_custom_op":
         return fusion_residual_rmsnorm(hidden_states, residual, weight, eps)
     if provider == "fusion_layer_api":
@@ -172,6 +176,11 @@ def benchmark_provider(
         )
     elif provider == "baseline_compiled":
         compiled_fn = torch.compile(baseline_residual_rmsnorm)
+        fn = lambda: compiled_fn(
+            hidden_states.clone(), residual.clone(), weight, eps
+        )
+    elif provider == "fusion_compiled":
+        compiled_fn = torch.compile(fusion_residual_rmsnorm)
         fn = lambda: compiled_fn(
             hidden_states.clone(), residual.clone(), weight, eps
         )
