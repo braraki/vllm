@@ -172,6 +172,9 @@ void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 
+void ple_gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& gate,
+                           torch::Tensor& value);
+
 void fatrelu_and_mul(torch::Tensor& out, torch::Tensor& input,
                      double threshold);
 void swigluoai_and_mul(torch::Tensor& out, torch::Tensor& input,

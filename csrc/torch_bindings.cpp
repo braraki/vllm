@@ -133,6 +133,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
 
+  // Activation function used in Gemma4 PLE: gelu_tanh(gate) * value.
+  ops.def("ple_gelu_tanh_and_mul(Tensor! out, Tensor gate, Tensor value) -> ()");
+  ops.impl("ple_gelu_tanh_and_mul", torch::kCUDA, &ple_gelu_tanh_and_mul);
+
   // FATReLU implementation.
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
   ops.impl("fatrelu_and_mul", torch::kCUDA, &fatrelu_and_mul);

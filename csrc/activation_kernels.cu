@@ -149,6 +149,55 @@ packed_gelu_tanh_kernel(const packed_t& val) {
 
 }  // namespace vllm
 
+template <typename scalar_t, typename packed_t,
+          scalar_t (*ACT_FN)(const scalar_t&),
+          packed_t (*PACKED_ACT_FN)(const packed_t&), bool use_vec,
+          bool use_256b = false>
+__global__ void two_input_act_and_mul_kernel(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ gate,
+    const scalar_t* __restrict__ value, const int d) {
+  const scalar_t* gate_ptr = gate + blockIdx.x * d;
+  const scalar_t* value_ptr = value + blockIdx.x * d;
+  scalar_t* out_ptr = out + blockIdx.x * d;
+
+  if constexpr (use_vec) {
+    using cuda_t = typename CUDATypeConverter<scalar_t>::Type;
+    using pvec_t = PackedVec<cuda_t, use_256b>;
+
+    const pvec_t* gate_vec = reinterpret_cast<const pvec_t*>(gate_ptr);
+    const pvec_t* value_vec = reinterpret_cast<const pvec_t*>(value_ptr);
+    pvec_t* out_vec = reinterpret_cast<pvec_t*>(out_ptr);
+    const int num_vecs = d / 2 / pvec_t::NUM_ELTS;
+
+    for (int i = threadIdx.x; i < num_vecs; i += blockDim.x) {
+      pvec_t gate_vals, value_vals;
+      if constexpr (use_256b) {
+        ld256(gate_vals, &gate_vec[i]);
+        ld256(value_vals, &value_vec[i]);
+      } else {
+        ld128(gate_vals, &gate_vec[i]);
+        ld128(value_vals, &value_vec[i]);
+      }
+#pragma unroll
+      for (int j = 0; j < pvec_t::NUM_ELTS; j++) {
+        gate_vals.elts[j] = packed_mul(
+            PACKED_ACT_FN(gate_vals.elts[j]), value_vals.elts[j]);
+      }
+      if constexpr (use_256b) {
+        st256(gate_vals, &out_vec[i]);
+      } else {
+        st128(gate_vals, &out_vec[i]);
+      }
+    }
+  } else {
+    for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
+      const scalar_t gate_val = VLLM_LDG(&gate_ptr[idx]);
+      const scalar_t value_val = VLLM_LDG(&value_ptr[idx]);
+      out_ptr[idx] = ACT_FN(gate_val) * value_val;
+    }
+  }
+}
+
 // Launch activation and gating kernel.
 // Use ACT_FIRST (bool) indicating whether to apply the activation function
 // first.
@@ -202,6 +251,59 @@ packed_gelu_tanh_kernel(const packed_t& val) {
     });                                                                        \
   }
 
+#define LAUNCH_TWO_INPUT_ACTIVATION_GATE_KERNEL(KERNEL, PACKED_KERNEL)         \
+  auto dtype = gate.scalar_type();                                             \
+  int d = gate.size(-1);                                                       \
+  int64_t num_tokens = gate.numel() / gate.size(-1);                           \
+  if (num_tokens == 0) {                                                       \
+    return;                                                                    \
+  }                                                                            \
+  dim3 grid(num_tokens);                                                       \
+  int cc_major = at::cuda::getCurrentDeviceProperties()->major;                \
+  int support_vec =                                                            \
+      (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128)            \
+          ? vllm::VecTraits<true>::ARCH_MAX_VEC_SIZE                           \
+          : vllm::VecTraits<false>::ARCH_MAX_VEC_SIZE;                         \
+  int vec_size = support_vec / at::elementSize(dtype);                         \
+  const bool use_vec = (d % vec_size == 0);                                    \
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(gate));             \
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                \
+  if (use_vec) {                                                               \
+    dim3 block(std::min(d / vec_size, 1024));                                  \
+    if (CUDA_VERSION >= 12090 && cc_major >= 10 && num_tokens > 128) {         \
+      VLLM_DISPATCH_FLOATING_TYPES(dtype, "two_input_act_and_mul_kernel", [&] {\
+        vllm::two_input_act_and_mul_kernel<                                     \
+            scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,      \
+            KERNEL<scalar_t>,                                                  \
+            PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>, \
+            true, true><<<grid, block, 0, stream>>>(                           \
+            out.data_ptr<scalar_t>(), gate.data_ptr<scalar_t>(),               \
+            value.data_ptr<scalar_t>(), d);                                    \
+      });                                                                      \
+    } else {                                                                   \
+      VLLM_DISPATCH_FLOATING_TYPES(dtype, "two_input_act_and_mul_kernel", [&] {\
+        vllm::two_input_act_and_mul_kernel<                                     \
+            scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,      \
+            KERNEL<scalar_t>,                                                  \
+            PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>, \
+            true, false><<<grid, block, 0, stream>>>(                          \
+            out.data_ptr<scalar_t>(), gate.data_ptr<scalar_t>(),               \
+            value.data_ptr<scalar_t>(), d);                                    \
+      });                                                                      \
+    }                                                                          \
+  } else {                                                                     \
+    dim3 block(std::min(d, 1024));                                             \
+    VLLM_DISPATCH_FLOATING_TYPES(dtype, "two_input_act_and_mul_kernel", [&] {  \
+      vllm::two_input_act_and_mul_kernel<                                      \
+          scalar_t, typename vllm::PackedTypeConverter<scalar_t>::Type,        \
+          KERNEL<scalar_t>,                                                    \
+          PACKED_KERNEL<typename vllm::PackedTypeConverter<scalar_t>::Type>,   \
+          false><<<grid, block, 0, stream>>>(                                  \
+          out.data_ptr<scalar_t>(), gate.data_ptr<scalar_t>(),                 \
+          value.data_ptr<scalar_t>(), d);                                      \
+    });                                                                        \
+  }
+
 void silu_and_mul(torch::Tensor& out,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
@@ -230,6 +332,25 @@ void gelu_tanh_and_mul(torch::Tensor& out,    // [..., d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel,
                                 vllm::packed_gelu_tanh_kernel, true);
+}
+
+void ple_gelu_tanh_and_mul(torch::Tensor& out,     // [..., d]
+                           torch::Tensor& gate,    // [..., d]
+                           torch::Tensor& value)   // [..., d]
+{
+  TORCH_CHECK(out.is_cuda(), "ple_gelu_tanh_and_mul expects a CUDA output tensor");
+  TORCH_CHECK(gate.sizes() == value.sizes(),
+              "gate and value must have identical shapes");
+  TORCH_CHECK(out.sizes() == gate.sizes(),
+              "out must have the same shape as gate/value");
+  TORCH_CHECK(out.scalar_type() == gate.scalar_type(),
+              "out must have the same dtype as gate/value");
+  TORCH_CHECK(gate.scalar_type() == value.scalar_type(),
+              "gate and value must have identical dtypes");
+  TORCH_CHECK(gate.is_cuda() && value.is_cuda(),
+              "ple_gelu_tanh_and_mul expects CUDA tensors");
+  LAUNCH_TWO_INPUT_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel,
+                                          vllm::packed_gelu_tanh_kernel);
 }
 
 namespace vllm {

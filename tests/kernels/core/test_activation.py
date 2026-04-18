@@ -14,6 +14,7 @@ from vllm.model_executor.layers.activation import (
     GeluAndMul,
     MulAndSilu,
     NewGELU,
+    PLEGeluAndMul,
     QuickGELU,
     SiluAndMul,
     SwigluOAIAndMul,
@@ -152,3 +153,30 @@ def test_activation(
 
     out = torch.empty_like(x)
     opcheck(fn, (out, x))
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("d", D)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_ple_gelu_and_mul(
+    default_vllm_config,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    set_random_seed(seed)
+    torch.set_default_device(device)
+    gate = torch.randn(num_tokens, d, dtype=dtype)
+    value = torch.randn_like(gate)
+    layer = PLEGeluAndMul()
+    out = layer(gate, value)
+    ref_out = layer.forward_native(gate, value)
+    torch.testing.assert_close(out, ref_out, atol=0.0, rtol=0.0)
+
+    out = torch.empty_like(gate)
+    opcheck(torch.ops._C.ple_gelu_tanh_and_mul, (out, gate, value))

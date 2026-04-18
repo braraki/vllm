@@ -36,7 +36,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, PLEGeluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -85,6 +85,10 @@ _PRE_FF_RESIDUAL_NORM_BASELINE_SCOPE = (
 )
 _PRE_FF_RESIDUAL_NORM_FUSION_SCOPE = (
     "gemma4.decoder.pre_ff_residual_norm:decoder_residual_fusion"
+)
+_PLE_GELU_AND_MUL_BASELINE_SCOPE = "gemma4.decoder.ple_gelu_and_mul:baseline"
+_PLE_GELU_AND_MUL_FUSION_SCOPE = (
+    "gemma4.decoder.ple_gelu_and_mul:ple_gelu_and_mul_fusion"
 )
 
 
@@ -455,6 +459,9 @@ class Gemma4DecoderLayer(nn.Module):
         self.use_decoder_residual_fusion = (
             kernel_experiment == "decoder-residual-fusion"
         )
+        self.use_ple_gelu_and_mul_fusion = (
+            kernel_experiment == "ple-gelu-and-mul-fusion"
+        )
 
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
@@ -588,13 +595,35 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+            self.ple_gelu_and_mul = PLEGeluAndMul()
         else:
             self.per_layer_input_gate = None
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
+            self.ple_gelu_and_mul = None
 
         # Layer scalar (loaded from checkpoint) — applies to ALL text layers
         self.register_buffer("layer_scalar", torch.ones(1))
+
+    def _apply_ple_gelu_and_mul(
+        self, gate: torch.Tensor, per_layer_input: torch.Tensor
+    ) -> torch.Tensor:
+        ple_scope = (
+            _PLE_GELU_AND_MUL_FUSION_SCOPE
+            if self.use_ple_gelu_and_mul_fusion
+            else _PLE_GELU_AND_MUL_BASELINE_SCOPE
+        )
+        scope_context = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else record_function_or_nullcontext(ple_scope)
+        )
+        with scope_context:
+            if self.use_ple_gelu_and_mul_fusion:
+                assert self.ple_gelu_and_mul is not None
+                return self.ple_gelu_and_mul(gate, per_layer_input)
+            gate = torch.nn.functional.gelu(gate, approximate="tanh")
+            return gate * per_layer_input
 
     def forward(
         self,
@@ -660,8 +689,7 @@ class Gemma4DecoderLayer(nn.Module):
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
             gate = self.per_layer_input_gate(hidden_states)
-            gate = torch.nn.functional.gelu(gate, approximate="tanh")
-            gated_per_layer = gate * per_layer_input
+            gated_per_layer = self._apply_ple_gelu_and_mul(gate, per_layer_input)
             per_layer_contribution = self.per_layer_projection(gated_per_layer)
             per_layer_contribution = self.post_per_layer_input_norm(
                 per_layer_contribution

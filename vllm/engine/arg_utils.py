@@ -655,6 +655,7 @@ class EngineArgs:
     gemma4_kernel_experiment: Literal[
         "baseline",
         "decoder-residual-fusion",
+        "ple-gelu-and-mul-fusion",
         "async-output-sync-reduction",
         "qk-norm-rope-fusion-lt-512",
         "qk-norm-rope-fusion-512",
@@ -1393,6 +1394,7 @@ class EngineArgs:
             choices=[
                 "baseline",
                 "decoder-residual-fusion",
+                "ple-gelu-and-mul-fusion",
                 "async-output-sync-reduction",
                 "qk-norm-rope-fusion-lt-512",
                 "qk-norm-rope-fusion-512",
@@ -1403,6 +1405,8 @@ class EngineArgs:
                 "'baseline' keeps the existing decoder behavior, while "
                 "'decoder-residual-fusion' enables the gated decoder "
                 "residual fusion experiment. "
+                "'ple-gelu-and-mul-fusion' enables the gated Gemma 4 PLE "
+                "GELU x multiply activation fusion experiment. "
                 "'async-output-sync-reduction' enables the gated async "
                 "scheduling output handoff experiment to reduce duplicate "
                 "sampled-token copy synchronization. "
