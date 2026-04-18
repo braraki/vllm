@@ -595,7 +595,9 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            self.ple_gelu_and_mul = PLEGeluAndMul()
+            self.ple_gelu_and_mul = (
+                PLEGeluAndMul() if self.use_ple_gelu_and_mul_fusion else None
+            )
         else:
             self.per_layer_input_gate = None
             self.per_layer_projection = None

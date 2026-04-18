@@ -318,7 +318,9 @@ class PLEGeluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike():
-            self.op = torch.ops._C.ple_gelu_tanh_and_mul
+            op = getattr(torch.ops._C, "ple_gelu_tanh_and_mul", None)
+            if op is not None:
+                self.op = op
         if current_platform.is_rocm():
             logger.warning_once(
                 "[ROCm] PyTorch's native GELU with tanh approximation is unstable "
@@ -333,6 +335,12 @@ class PLEGeluAndMul(CustomOp):
         return F.gelu(gate, approximate=approximate) * value
 
     def forward_cuda(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "op"):
+            raise RuntimeError(
+                "PLEGeluAndMul requires torch.ops._C.ple_gelu_tanh_and_mul, "
+                "but the custom op is not registered. Rebuild vLLM so the "
+                "new CUDA extension is available."
+            )
         out = torch.empty_like(gate)
         self.op(out, gate, value)
         return out
