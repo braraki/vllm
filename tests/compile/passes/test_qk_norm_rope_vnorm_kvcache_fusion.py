@@ -114,7 +114,13 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
 
     def forward(
         self, qkv: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
@@ -125,12 +131,18 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
 
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
+        output = torch.empty(
+            (q.shape[0], self.num_heads * self.head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        output = output.view(-1, self.num_heads, self.head_dim)
         kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
             k,
             v,
             _encode_layer_name(self.layer_name),
         )
-        return q, k, v, kv_cache_dummy
+        return q, k, v, output, kv_cache_dummy
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
