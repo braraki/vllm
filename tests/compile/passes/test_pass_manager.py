@@ -11,7 +11,7 @@ from vllm.compilation.passes.inductor_pass import (
     pass_context,
 )
 from vllm.compilation.passes.pass_manager import PostGradPassManager
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import CompilationConfig, ModelConfig, PassConfig, VllmConfig
 from vllm.config.utils import Range
 
 
@@ -81,3 +81,23 @@ def test_pass_manager_uuid(callable):
         pass_manager3.configure(config2)
         pass_manager3.add(callable)
         assert uuid1 != pass_manager3.uuid()
+
+
+def test_pre_attention_kernel_skips_rope_kvcache_pass():
+    config = VllmConfig(
+        model_config=ModelConfig(dtype=torch.bfloat16),
+        compilation_config=CompilationConfig(
+            pass_config=PassConfig(
+                fuse_rope_kvcache=True,
+                enable_qk_norm_rope_fusion=True,
+            )
+        ),
+        additional_config={"gemma4_pre_attention_kernel": True},
+    )
+
+    pass_manager = PostGradPassManager()
+    pass_manager.configure(config)
+
+    pass_names = {type(pass_).__name__ for pass_ in pass_manager.passes}
+    assert "QKNormRoPEFusionPass" in pass_names
+    assert "RopeKVCacheFusionPass" not in pass_names
