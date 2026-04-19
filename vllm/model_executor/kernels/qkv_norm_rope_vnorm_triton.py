@@ -3,7 +3,6 @@
 
 import torch
 
-from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.torch_utils import (
@@ -359,6 +358,8 @@ def _validate_full_post_gemm_fusion_support(
     position_ids: torch.Tensor,
     layer_name: LayerNameType,
 ):
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+
     _raise_if_unsupported(
         qkv,
         num_heads_q,
