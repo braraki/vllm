@@ -108,14 +108,15 @@ def _make_rope_cache(
     dtype: torch.dtype,
     is_neox: bool,
 ) -> torch.Tensor:
-    rope = RotaryEmbedding(
-        head_size=head_dim,
-        rotary_dim=head_dim,
-        max_position_embeddings=max_position_embeddings,
-        base=10000.0,
-        is_neox_style=is_neox,
-        dtype=dtype,
-    )
+    with default_vllm_config():
+        rope = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=10000.0,
+            is_neox_style=is_neox,
+            dtype=dtype,
+        )
     return rope.cos_sin_cache.to(device="cuda", dtype=dtype)
 
 
@@ -310,6 +311,7 @@ def benchmark_provider(
     return ms, min_ms, max_ms
 
 
+@default_vllm_config()
 def validate_outputs(
     head_dim: int,
     num_heads: int,
