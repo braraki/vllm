@@ -315,7 +315,6 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         self._part4_reject_log_budget = 0
         self._part4_supported_layers: dict[str, Attention] = {}
         self._part4_supported_signatures: set[tuple[int, int, int]] = set()
-        self._part4_ambiguous_signatures: set[tuple[int, int, int]] = set()
         self._part4_custom_rewrite_enabled = (
             self.experiment_mode == "qkv-norm-rope-vnorm-kvcache-fusion"
         )
@@ -388,20 +387,6 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                 layer.layer_name: layer for layer in supported_layers
             }
             self._part4_supported_signatures = set(supported_attn_signatures)
-            unsupported_signatures = {
-                (layer.head_size, layer.num_heads, layer.num_kv_heads)
-                for layer in attn_layers.values()
-                if not self._supports_part4_full_fusion(layer, layer.head_size)
-            }
-            self._part4_ambiguous_signatures = (
-                self._part4_supported_signatures & unsupported_signatures
-            )
-            if self._part4_ambiguous_signatures:
-                logger.info(
-                    "Part 4 full post-GEMM fusion requires exact layer "
-                    "resolution for ambiguous signatures: %s",
-                    sorted(self._part4_ambiguous_signatures),
-                )
             if _pattern_debug_enabled():
                 logger.debug(
                     "Part 4 full post-GEMM fusion registering signatures: %s",
@@ -748,12 +733,6 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                     signature=signature,
                 )
                 return None
-        elif signature in self._part4_ambiguous_signatures:
-            self._part4_debug_log(
-                "reject: ambiguous signature requires exact layer resolution",
-                signature=signature,
-            )
-            return None
 
         q_size = num_heads * head_dim
         layer_debug = resolved_layer_name or f"signature={signature}"
