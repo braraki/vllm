@@ -750,13 +750,7 @@ class QKVNormRopeVNormKVCachePattern:
                 v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
                 layer_name,
-            ) -> tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]:
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 head_dim = q_weight.shape[-1]
                 kv_size = self.num_kv_heads * head_dim
                 q_size = qkv.shape[-1] - 2 * kv_size
@@ -790,16 +784,10 @@ class QKVNormRopeVNormKVCachePattern:
 
                 q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
                 k_heads = k_rope.view(-1, self.num_kv_heads, self.head_dim)
-                output = torch.empty(
-                    (*q.shape[:-1], self.num_heads * self.head_dim),
-                    dtype=qkv.dtype,
-                    device=qkv.device,
-                )
-                output_heads = output.view(-1, self.num_heads, self.head_dim)
                 kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
                     k_heads, v_normed_heads, layer_name
                 )
-                return q_heads, k_heads, v_normed_heads, output_heads, kv_cache_dummy
+                return q_heads, k_heads, v_normed_heads, kv_cache_dummy
 
             def replacement(
                 qkv: torch.Tensor,
@@ -809,13 +797,7 @@ class QKVNormRopeVNormKVCachePattern:
                 v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
                 layer_name,
-            ) -> tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]:
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 assert FUSED_QKV_ROPE_VNORM_KVCACHE_OP is not None
                 head_dim = q_weight.shape[-1]
                 kv_size = self.num_kv_heads * head_dim
@@ -843,13 +825,7 @@ class QKVNormRopeVNormKVCachePattern:
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
-                output = torch.empty(
-                    (q.shape[0], self.num_heads * self.head_dim),
-                    dtype=q.dtype,
-                    device=q.device,
-                )
-                output_heads = output.view(-1, self.num_heads, self.head_dim)
-                return q, k, v, output_heads, result[0]
+                return q, k, v, result[0]
 
         else:
 
@@ -860,13 +836,7 @@ class QKVNormRopeVNormKVCachePattern:
                 k_weight: torch.Tensor,
                 v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
-            ) -> tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]:
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 head_dim = q_weight.shape[-1]
                 kv_size = self.num_kv_heads * head_dim
                 q_size = qkv.shape[-1] - 2 * kv_size
@@ -900,16 +870,10 @@ class QKVNormRopeVNormKVCachePattern:
 
                 q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
                 k_heads = k_rope.view(-1, self.num_kv_heads, self.head_dim)
-                output = torch.empty(
-                    (*q.shape[:-1], self.num_heads * self.head_dim),
-                    dtype=qkv.dtype,
-                    device=qkv.device,
-                )
-                output_heads = output.view(-1, self.num_heads, self.head_dim)
                 kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
                     k_heads, v_normed_heads, encoded_layer_name
                 )
-                return q_heads, k_heads, v_normed_heads, output_heads, kv_cache_dummy
+                return q_heads, k_heads, v_normed_heads, kv_cache_dummy
 
             def replacement(
                 qkv: torch.Tensor,
@@ -918,13 +882,7 @@ class QKVNormRopeVNormKVCachePattern:
                 k_weight: torch.Tensor,
                 v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
-            ) -> tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]:
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 assert FUSED_QKV_ROPE_VNORM_KVCACHE_OP is not None
                 head_dim = q_weight.shape[-1]
                 kv_size = self.num_kv_heads * head_dim
@@ -952,13 +910,7 @@ class QKVNormRopeVNormKVCachePattern:
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
-                output = torch.empty(
-                    (q.shape[0], self.num_heads * self.head_dim),
-                    dtype=q.dtype,
-                    device=q.device,
-                )
-                output_heads = output.view(-1, self.num_heads, self.head_dim)
-                return q, k, v, output_heads, result[0]
+                return q, k, v, result[0]
 
         pm.register_replacement(
             pattern,
