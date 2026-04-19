@@ -11,6 +11,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
 import vllm.ir.ops
+from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels import qkv_norm_rope_vnorm_triton as _qkv_norm_rope_vnorm_triton  # noqa: F401
@@ -47,6 +48,10 @@ LT_512_FUSED_QK_ROPE_HEAD_DIMS = {64, 128, 256}
 CUDA_512_FUSED_QK_ROPE_HEAD_DIMS = LT_512_FUSED_QK_ROPE_HEAD_DIMS | {512}
 
 P = ParamSpec("P")
+
+
+def _pattern_debug_enabled() -> bool:
+    return envs.VLLM_PATTERN_MATCH_DEBUG is not None
 
 
 class QkNormRopePattern:
@@ -334,6 +339,11 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                     "Gemma4 TritonAttention decoder signatures found"
                 )
                 return
+            if _pattern_debug_enabled():
+                logger.debug(
+                    "Part 4 full post-GEMM fusion registering signatures: %s",
+                    supported_attn_signatures,
+                )
 
             for epsilon in [1e-5, 1e-6]:
                 for neox in [True, False]:
@@ -652,34 +662,81 @@ class QKVNormRopeVNormKVCachePattern:
         return inputs
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        debug_log_budget = {"count": 0}
+
+        def log_signature_check(message: str, **extra) -> None:
+            if not _pattern_debug_enabled():
+                return
+            if debug_log_budget["count"] >= 24:
+                return
+            debug_log_budget["count"] += 1
+            logger.debug(
+                "Part 4 signature_matches[%s hd=%s h=%s kv=%s neox=%s]: %s%s",
+                self.layer_name,
+                self.head_dim,
+                self.num_heads,
+                self.num_kv_heads,
+                self.is_neox,
+                message,
+                f" | {extra}" if extra else "",
+            )
+
         def signature_matches(match: pm.Match) -> bool:
             weighted_shapes: list[tuple[int, int]] = []
             weightless_shapes: list[tuple[int, int]] = []
+            log_signature_check("called", nodes=len(match.nodes))
             for node in match.nodes:
                 if node.target != RMS_NORM_OP:
                     continue
                 x = node.args[0]
                 weight = node.args[1]
                 if not isinstance(x, fx.Node):
+                    log_signature_check("rejected: rms_norm input is not fx.Node")
                     return False
                 x_shape = tuple(x.meta["val"].shape)
                 if x_shape[-1] != self.head_dim:
+                    log_signature_check(
+                        "rejected: rms_norm input last dim mismatch",
+                        x_shape=x_shape,
+                    )
                     return False
                 if weight is None:
                     weightless_shapes.append((x_shape[-2], x_shape[-1]))
                     continue
                 if not isinstance(weight, fx.Node):
+                    log_signature_check(
+                        "rejected: rms_norm weight is not fx.Node",
+                        x_shape=x_shape,
+                    )
                     return False
                 weight_shape = tuple(weight.meta["val"].shape)
                 if weight_shape[-1] != self.head_dim:
+                    log_signature_check(
+                        "rejected: rms_norm weight last dim mismatch",
+                        x_shape=x_shape,
+                        weight_shape=weight_shape,
+                    )
                     return False
                 weighted_shapes.append((x_shape[-2], x_shape[-1]))
 
-            return (
+            matched = (
                 weighted_shapes.count((self.num_heads, self.head_dim)) >= 1
                 and weighted_shapes.count((self.num_kv_heads, self.head_dim)) >= 2
                 and weightless_shapes.count((self.num_kv_heads, self.head_dim)) == 0
             )
+            if matched:
+                log_signature_check(
+                    "accepted",
+                    weighted_shapes=weighted_shapes,
+                    weightless_shapes=weightless_shapes,
+                )
+            else:
+                log_signature_check(
+                    "rejected: weighted/weightless shape counts",
+                    weighted_shapes=weighted_shapes,
+                    weightless_shapes=weightless_shapes,
+                )
+            return matched
 
         encoded_layer_name = _encode_layer_name(self.layer_name)
 
