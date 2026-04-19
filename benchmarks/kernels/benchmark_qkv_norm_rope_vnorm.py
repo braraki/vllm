@@ -373,18 +373,26 @@ def write_plots(rows: list[dict[str, float | int | str]], output_dir: Path) -> N
                 group_pos - 0.4 + (provider_idx + 0.5) * bar_width
                 for group_pos in group_positions
             ]
-            latencies = [
-                grouped_rows[(provider, token_count)] for token_count in token_counts
+            latencies_us = [
+                grouped_rows[(provider, token_count)] * 1000.0
+                for token_count in token_counts
             ]
-            plt.bar(
+            bars = plt.bar(
                 x_positions,
-                latencies,
+                latencies_us,
                 width=bar_width,
                 label=provider,
             )
+            plt.bar_label(
+                bars,
+                labels=[f"{latency_us:.1f}" for latency_us in latencies_us],
+                padding=3,
+                fontsize=8,
+                rotation=90,
+            )
         plt.title(f"Attention Prep Fusion Benchmark (head_dim={head_dim})")
         plt.xlabel("num_tokens")
-        plt.ylabel("median latency (ms)")
+        plt.ylabel("median latency (us)")
         plt.xticks(group_positions, [str(token_count) for token_count in token_counts])
         plt.grid(True, axis="y", linestyle="--", alpha=0.4)
         plt.legend()
