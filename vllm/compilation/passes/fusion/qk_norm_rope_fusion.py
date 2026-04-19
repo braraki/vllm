@@ -787,7 +787,7 @@ class QKVNormRopeVNormKVCachePattern:
                 kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
                     k_heads, v_normed_heads, layer_name
                 )
-                return kv_cache_dummy, q_heads, k_heads, v_normed_heads
+                return q_heads, k_heads, v_normed_heads, kv_cache_dummy
 
             def replacement(
                 qkv: torch.Tensor,
@@ -825,7 +825,7 @@ class QKVNormRopeVNormKVCachePattern:
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
-                return result[0], q, k, v
+                return q, k, v, result[0]
 
         else:
 
@@ -873,7 +873,7 @@ class QKVNormRopeVNormKVCachePattern:
                 kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
                     k_heads, v_normed_heads, encoded_layer_name
                 )
-                return kv_cache_dummy, q_heads, k_heads, v_normed_heads
+                return q_heads, k_heads, v_normed_heads, kv_cache_dummy
 
             def replacement(
                 qkv: torch.Tensor,
@@ -910,7 +910,7 @@ class QKVNormRopeVNormKVCachePattern:
                 q = q.view(-1, self.num_heads, self.head_dim)
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
-                return result[0], q, k, v
+                return q, k, v, result[0]
 
         pm.register_replacement(
             pattern,

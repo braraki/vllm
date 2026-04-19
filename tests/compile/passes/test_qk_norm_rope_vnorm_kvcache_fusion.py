@@ -130,7 +130,7 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
             v,
             _encode_layer_name(self.layer_name),
         )
-        return kv_cache_dummy, q, k, v
+        return q, k, v, kv_cache_dummy
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
