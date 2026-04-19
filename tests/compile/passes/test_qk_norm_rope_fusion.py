@@ -185,7 +185,7 @@ class QKVNormRoPEVNormTestModel(torch.nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim, eps=self.eps)
         self.k_norm = RMSNorm(self.head_dim, eps=self.eps)
-        self.v_norm = RMSNorm(self.head_dim, eps=self.eps)
+        self.v_norm = RMSNorm(self.head_dim, eps=self.eps, has_weight=False)
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
             rotary_dim=self.rotary_dim,

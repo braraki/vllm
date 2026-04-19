@@ -306,11 +306,8 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
-        self.qk_patterns: PatternMatcherPass = PatternMatcherPass(
-            pass_name="qk_norm_rope_fusion_pass_qk"
-        )
-        self.qkv_vnorm_patterns: PatternMatcherPass = PatternMatcherPass(
-            pass_name="qk_norm_rope_fusion_pass_qkv_vnorm"
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="qk_norm_rope_fusion_pass"
         )
         self.experiment_mode = str(
             config.additional_config.get("gemma4_kernel_experiment", "baseline")
@@ -318,9 +315,6 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         self._part4_reject_log_budget = 0
         self._part4_supported_layers: dict[str, Attention] = {}
         self._part4_supported_signatures: set[tuple[int, int, int]] = set()
-        self._part4_presplit_eligible_count = 0
-        self._part4_presplit_total_kvcache_sites = 0
-        self._last_stage_counts: dict[str, int] = {}
         self._part4_custom_rewrite_enabled = (
             self.experiment_mode == "qkv-norm-rope-vnorm-kvcache-fusion"
         )
@@ -356,53 +350,49 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                     "rewrite because the fused Part 4 custom op is not "
                     "available in torch.ops.vllm."
                 )
-                self._part4_custom_rewrite_enabled = False
+                return
 
-            if self._part4_custom_rewrite_enabled:
-                supported_layers = [
-                    layer
+            supported_layers = [
+                layer
+                for layer in attn_layers.values()
+                if self._supports_part4_full_fusion(layer, layer.head_size)
+            ]
+            supported_attn_signatures = sorted(
+                {
+                    (layer.head_size, layer.num_heads, layer.num_kv_heads)
+                    for layer in supported_layers
+                }
+            )
+            skipped_attn_signatures = sorted(
+                {
+                    (layer.head_size, layer.num_heads, layer.num_kv_heads)
                     for layer in attn_layers.values()
-                    if self._supports_part4_full_fusion(layer, layer.head_size)
-                ]
-                supported_attn_signatures = sorted(
-                    {
-                        (layer.head_size, layer.num_heads, layer.num_kv_heads)
-                        for layer in supported_layers
-                    }
+                    if (layer.head_size, layer.num_heads, layer.num_kv_heads)
+                    not in supported_attn_signatures
+                }
+            )
+            if skipped_attn_signatures:
+                logger.info(
+                    "Part 4 full post-GEMM fusion skipping unsupported "
+                    "attention signatures: %s",
+                    skipped_attn_signatures,
                 )
-                skipped_attn_signatures = sorted(
-                    {
-                        (layer.head_size, layer.num_heads, layer.num_kv_heads)
-                        for layer in attn_layers.values()
-                        if (layer.head_size, layer.num_heads, layer.num_kv_heads)
-                        not in supported_attn_signatures
-                    }
+            if not supported_attn_signatures:
+                logger.warning_once(
+                    "Part 4 full post-GEMM fusion not enabled: no supported "
+                    "Gemma4 TritonAttention decoder signatures found"
                 )
-                if skipped_attn_signatures:
-                    logger.info(
-                        "Part 4 full post-GEMM fusion skipping unsupported "
-                        "attention signatures: %s",
-                        skipped_attn_signatures,
-                    )
-                if not supported_attn_signatures:
-                    logger.warning_once(
-                        "Part 4 full post-GEMM fusion not enabled: no supported "
-                        "Gemma4 TritonAttention decoder signatures found"
-                    )
-                    self._part4_custom_rewrite_enabled = False
-                else:
-                    self._part4_supported_layers = {
-                        layer.layer_name: layer for layer in supported_layers
-                    }
-                    self._part4_supported_signatures = set(
-                        supported_attn_signatures
-                    )
-                    if _pattern_debug_enabled():
-                        logger.debug(
-                            "Part 4 full post-GEMM fusion registering "
-                            "signatures: %s",
-                            supported_attn_signatures,
-                        )
+                return
+            self._part4_supported_layers = {
+                layer.layer_name: layer for layer in supported_layers
+            }
+            self._part4_supported_signatures = set(supported_attn_signatures)
+            if _pattern_debug_enabled():
+                logger.debug(
+                    "Part 4 full post-GEMM fusion registering signatures: %s",
+                    supported_attn_signatures,
+                )
+            return
 
         attn_signatures = sorted(
             {
@@ -442,25 +432,22 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         for epsilon in [1e-5, 1e-6]:
             for neox in [True, False]:
                 for head_dim, num_heads, num_kv_heads in supported_attn_signatures:
-                    if self.experiment_mode in (
-                        "qkv-norm-rope-vnorm-fusion",
-                        "qkv-norm-rope-vnorm-kvcache-fusion",
-                    ):
+                    if self.experiment_mode == "qkv-norm-rope-vnorm-fusion":
                         if FUSED_QKV_ROPE_VNORM_OP is None:
                             logger.warning(
                                 "Skipping qkv-norm-rope-vnorm-fusion pattern "
                                 "registration because fused_qkv_norm_rope_vnorm "
                                 "is not available in torch.ops.vllm."
                             )
-                        else:
-                            QKVNormRopeVNormPattern(
-                                head_dim=head_dim,
-                                num_heads=num_heads,
-                                num_kv_heads=num_kv_heads,
-                                eps=epsilon,
-                                is_neox=neox,
-                            ).register(self.qkv_vnorm_patterns)
-                    if self.experiment_mode != "qkv-norm-rope-vnorm-fusion":
+                            continue
+                        QKVNormRopeVNormPattern(
+                            head_dim=head_dim,
+                            num_heads=num_heads,
+                            num_kv_heads=num_kv_heads,
+                            eps=epsilon,
+                            is_neox=neox,
+                        ).register(self.patterns)
+                    else:
                         if RotaryEmbedding.enabled():
                             for rope_flashinfer in [False, True]:
                                 QkNormRopePattern(
@@ -470,7 +457,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                                     eps=epsilon,
                                     is_neox=neox,
                                     rope_flashinfer=rope_flashinfer,
-                                ).register(self.qk_patterns)
+                                ).register(self.patterns)
                         else:
                             QkNormRopePattern(
                                 head_dim=head_dim,
@@ -478,12 +465,9 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                                 num_kv_heads=num_kv_heads,
                                 eps=epsilon,
                                 is_neox=neox,
-                            ).register(self.qk_patterns)
+                            ).register(self.patterns)
 
-        if self.qkv_vnorm_patterns.patterns:
-            self.dump_patterns(config, self.qkv_vnorm_patterns)
-        if self.qk_patterns.patterns:
-            self.dump_patterns(config, self.qk_patterns)
+        self.dump_patterns(config, self.patterns)
 
     def _part4_debug_log(self, message: str, **extra: Any) -> None:
         if not _pattern_debug_enabled():
@@ -557,10 +541,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             return None
 
     def _match_part4_candidate(
-        self,
-        kv_cache_dummy: fx.Node,
-        *,
-        allow_live_boundary_users: bool = False,
+        self, kv_cache_dummy: fx.Node
     ) -> Part4FusionCandidate | None:
         if not is_func(
             kv_cache_dummy, torch.ops.vllm.unified_kv_cache_update.default
@@ -901,61 +882,34 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         ):
             self._part4_debug_log("reject: k rotary getitem has unexpected users")
             return None
-        if allow_live_boundary_users:
-            q_boundary_users = self._iter_non_output_users(q_heads)
-            k_boundary_users = self._iter_non_output_users(k_heads)
-            v_boundary_users = self._iter_non_output_users(v_heads)
-            if not q_heads.users:
-                self._part4_debug_log("reject: q_heads has no downstream users")
-                return None
-            if len(q_boundary_users) > 1:
-                self._part4_debug_log("reject: q_heads has extra boundary users")
-                return None
-            if kv_cache_dummy not in k_boundary_users:
-                self._part4_debug_log(
-                    "reject: k_heads no longer feeds kv cache update"
-                )
-                return None
-            if len(k_boundary_users) > 2:
-                self._part4_debug_log("reject: k_heads has extra boundary users")
-                return None
-            if kv_cache_dummy not in v_boundary_users:
-                self._part4_debug_log(
-                    "reject: v_heads no longer feeds kv cache update"
-                )
-                return None
-            if len(v_boundary_users) > 2:
-                self._part4_debug_log("reject: v_heads has extra boundary users")
-                return None
-        else:
-            if not self._has_expected_users(
-                q_heads,
-                expected_non_output=set(),
-                output_count=1,
-            ):
-                self._part4_debug_log("reject: q_heads has unexpected users")
-                return None
-            if not self._has_expected_users(
-                k_heads,
-                expected_non_output={kv_cache_dummy},
-                output_count=1,
-            ):
-                self._part4_debug_log("reject: k_heads has unexpected users")
-                return None
-            if not self._has_expected_users(
-                v_heads,
-                expected_non_output={kv_cache_dummy},
-                output_count=1,
-            ):
-                self._part4_debug_log("reject: v_heads has unexpected users")
-                return None
-            if not self._has_expected_users(
-                kv_cache_dummy,
-                expected_non_output=set(),
-                output_count=1,
-            ):
-                self._part4_debug_log("reject: kv cache dummy has unexpected users")
-                return None
+        if not self._has_expected_users(
+            q_heads,
+            expected_non_output=set(),
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: q_heads has unexpected users")
+            return None
+        if not self._has_expected_users(
+            k_heads,
+            expected_non_output={kv_cache_dummy},
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: k_heads has unexpected users")
+            return None
+        if not self._has_expected_users(
+            v_heads,
+            expected_non_output={kv_cache_dummy},
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: v_heads has unexpected users")
+            return None
+        if not self._has_expected_users(
+            kv_cache_dummy,
+            expected_non_output=set(),
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: kv cache dummy has unexpected users")
+            return None
 
         self._part4_debug_log(
             "accepted",
@@ -1090,98 +1044,13 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             matched += 1
         return matched
 
-    def collect_part4_split_exempt_nodes(
-        self, graph: fx.GraphModule | fx.Graph
-    ) -> set[fx.Node]:
-        if not self._part4_custom_rewrite_enabled:
-            self._part4_presplit_eligible_count = 0
-            self._part4_presplit_total_kvcache_sites = 0
-            return set()
-
-        node_iter = (
-            graph.graph.nodes if isinstance(graph, fx.GraphModule) else graph.nodes
-        )
-        exempt_nodes: set[fx.Node] = set()
-        total_kvcache_sites = 0
-        for node in node_iter:
-            if not is_func(node, torch.ops.vllm.unified_kv_cache_update.default):
-                continue
-            total_kvcache_sites += 1
-            if (
-                self._match_part4_candidate(
-                    node, allow_live_boundary_users=True
-                )
-                is not None
-            ):
-                exempt_nodes.add(node)
-
-        self._part4_presplit_total_kvcache_sites = total_kvcache_sites
-        self._part4_presplit_eligible_count = len(exempt_nodes)
-        if _pattern_debug_enabled():
-            logger.debug(
-                "Part 4 pre-split eligible sites: %d/%d",
-                self._part4_presplit_eligible_count,
-                self._part4_presplit_total_kvcache_sites,
-            )
-        return exempt_nodes
-
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self._part4_reject_log_budget = 0
         if self._part4_custom_rewrite_enabled:
-            part4_matches = self._rewrite_part4(graph)
-            qkv_vnorm_matches = self.qkv_vnorm_patterns.apply(graph)
-            qk_matches = self.qk_patterns.apply(graph)
-            self._last_stage_counts = {
-                "part4_full": part4_matches,
-                "qkv_vnorm_fallback": qkv_vnorm_matches,
-                "qk_fallback": qk_matches,
-            }
-            self.matched_count = (
-                part4_matches + qkv_vnorm_matches + qk_matches
-            )
-            if _pattern_debug_enabled():
-                residual_pre_attention = sum(
-                    1
-                    for node in graph.nodes
-                    if is_auto_func(node, torch.ops._C.rotary_embedding.default)
-                )
-                residual_kvcache_sites = sum(
-                    1
-                    for node in graph.nodes
-                    if is_func(node, torch.ops.vllm.unified_kv_cache_update.default)
-                )
-                if part4_matches < self._part4_presplit_eligible_count:
-                    logger.debug(
-                        "Part 4 pre-split/post-pass mismatch: presplit=%d "
-                        "postpass=%d",
-                        self._part4_presplit_eligible_count,
-                        part4_matches,
-                    )
-                logger.debug(
-                    "Part 4 layered coverage: presplit=%d full=%d qkv_vnorm=%d "
-                    "qk=%d residual_pre_attention=%d residual_kv_cache=%d",
-                    self._part4_presplit_eligible_count,
-                    part4_matches,
-                    qkv_vnorm_matches,
-                    qk_matches,
-                    residual_pre_attention,
-                    residual_kvcache_sites,
-                )
-        elif self.experiment_mode == "qkv-norm-rope-vnorm-fusion":
-            self.matched_count = self.qkv_vnorm_patterns.apply(graph)
-            self._last_stage_counts = {
-                "part4_full": 0,
-                "qkv_vnorm_fallback": self.matched_count,
-                "qk_fallback": 0,
-            }
+            self.matched_count = self._rewrite_part4(graph)
         else:
-            self.matched_count = self.qk_patterns.apply(graph)
-            self._last_stage_counts = {
-                "part4_full": 0,
-                "qkv_vnorm_fallback": 0,
-                "qk_fallback": self.matched_count,
-            }
+            self.matched_count = self.patterns.apply(graph)
         VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
         logger.debug("Fused QK Norm+RoPE on %s sites", self.matched_count)
 
@@ -1225,14 +1094,12 @@ class QKVNormRopeVNormPattern:
         positions = empty_i64(T)
         q_weight = empty_bf16(self.head_dim)
         k_weight = empty_bf16(self.head_dim)
-        v_weight = empty_bf16(self.head_dim)
         cos_sin_cache = empty_bf16(4096, self.head_dim)
         return [
             qkv,
             positions,
             q_weight,
             k_weight,
-            v_weight,
             cos_sin_cache,
         ]
 
@@ -1262,8 +1129,8 @@ class QKVNormRopeVNormPattern:
 
             return (
                 (self.num_heads, self.head_dim) in weighted_shapes
-                and weighted_shapes.count((self.num_kv_heads, self.head_dim)) >= 2
-                and weightless_shapes.count((self.num_kv_heads, self.head_dim)) == 0
+                and (self.num_kv_heads, self.head_dim) in weighted_shapes
+                and weightless_shapes.count((self.num_kv_heads, self.head_dim)) == 1
             )
 
         def pattern(
@@ -1271,7 +1138,6 @@ class QKVNormRopeVNormPattern:
             positions: torch.Tensor,
             q_weight: torch.Tensor,
             k_weight: torch.Tensor,
-            v_weight: torch.Tensor,
             cos_sin_cache: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             head_dim = q_weight.shape[-1]
@@ -1301,7 +1167,7 @@ class QKVNormRopeVNormPattern:
             k_rope = result[2]
 
             v_by_head = v.view(*v.shape[:-1], self.num_kv_heads, head_dim)
-            v_normed_by_head = vllm.ir.ops.rms_norm(v_by_head, v_weight, self.eps)
+            v_normed_by_head = vllm.ir.ops.rms_norm(v_by_head, None, self.eps)
             v_flat = v_normed_by_head.view(v.shape)
             return q_rope, k_rope, v_flat
 
@@ -1310,7 +1176,6 @@ class QKVNormRopeVNormPattern:
             positions: torch.Tensor,
             q_weight: torch.Tensor,
             k_weight: torch.Tensor,
-            v_weight: torch.Tensor,
             cos_sin_cache: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             assert FUSED_QKV_ROPE_VNORM_OP is not None
@@ -1328,7 +1193,6 @@ class QKVNormRopeVNormPattern:
                 eps=self.eps,
                 q_weight=q_weight,
                 k_weight=k_weight,
-                v_weight=v_weight,
                 cos_sin_cache=cos_sin_cache,
                 is_neox=self.is_neox,
                 position_ids=positions.view(-1),

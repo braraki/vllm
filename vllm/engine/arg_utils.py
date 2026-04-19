@@ -2167,11 +2167,7 @@ class EngineArgs:
                 compilation_config.custom_ops.append("+rms_norm")
             if "+rotary_embedding" not in compilation_config.custom_ops:
                 compilation_config.custom_ops.append("+rotary_embedding")
-            if (
-                self.gemma4_kernel_experiment
-                == "qkv-norm-rope-vnorm-kvcache-fusion"
-                and compilation_config.use_inductor_graph_partition
-            ):
+            if self.gemma4_kernel_experiment == "qkv-norm-rope-vnorm-kvcache-fusion":
                 compilation_config.splitting_ops = [
                     op
                     for op in compilation_config.splitting_ops
