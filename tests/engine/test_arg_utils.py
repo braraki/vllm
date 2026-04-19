@@ -22,6 +22,7 @@ from vllm.engine.arg_utils import (
     optional_type,
     parse_type,
 )
+from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
@@ -446,6 +447,52 @@ def test_prefix_cache_default():
     args = parser.parse_args(["--no-enable-prefix-caching"])
     engine_args = EngineArgs.from_cli_args(args=args)
     assert not engine_args.enable_prefix_caching
+
+
+def test_gemma4_pre_attention_kernel_flag_parser():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args(["--gemma4-pre-attention-kernel"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.gemma4_pre_attention_kernel is True
+
+    args = parser.parse_args(["--no-gemma4-pre-attention-kernel"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.gemma4_pre_attention_kernel is False
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="pre-attention-kernel config mutation requires CUDA",
+)
+def test_gemma4_pre_attention_kernel_engine_config():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        gemma4_pre_attention_kernel=True,
+        compilation_config={
+            "mode": CompilationMode.VLLM_COMPILE,
+            "custom_ops": [],
+            "splitting_ops": [
+                "vllm::unified_attention_with_output",
+                "vllm::unified_kv_cache_update",
+                "vllm::unified_mla_kv_cache_update",
+            ],
+        },
+    )
+    vllm_config = engine_args.create_engine_config()
+
+    assert vllm_config.additional_config["gemma4_pre_attention_kernel"] is True
+    assert vllm_config.compilation_config.pass_config.enable_qk_norm_rope_fusion
+    assert "+rms_norm" in vllm_config.compilation_config.custom_ops
+    assert "+rotary_embedding" in vllm_config.compilation_config.custom_ops
+    assert (
+        "vllm::unified_kv_cache_update"
+        not in vllm_config.compilation_config.splitting_ops
+    )
+    assert (
+        "vllm::unified_mla_kv_cache_update"
+        in vllm_config.compilation_config.splitting_ops
+    )
 
 
 @pytest.mark.parametrize(

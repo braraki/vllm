@@ -155,6 +155,14 @@ def test_topk_sigmoid_dispatch(use_rocm_aiter: bool):
         assert topk_func == vllm_topk_sigmoid
 
 
+def test_pre_attention_kernel_custom_op_registered():
+    import vllm._custom_ops  # noqa: F401
+
+    assert hasattr(
+        torch.ops.vllm, "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update"
+    )
+
+
 @pytest.mark.parametrize("add_residual", [False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_rocm_aiter", [True, False])
