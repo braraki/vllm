@@ -341,6 +341,14 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
 
         self.dump_patterns(config, self.patterns)
 
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        self.matched_count = self.patterns.apply(graph)
+        logger.debug("Fused QK Norm+RoPE on %s sites", self.matched_count)
+
+    def uuid(self) -> str:
+        return VllmInductorPass.hash_source(self, QkNormRopePattern)
+
 
 class QKVNormRopeVNormPattern:
     """Match Gemma4 non-KV-shared attention prep and replace it with one op."""
@@ -491,11 +499,3 @@ class QKVNormRopeVNormPattern:
             pm_pass,
             extra_check=signature_matches,
         )
-
-    @VllmInductorPass.time_and_log
-    def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
-        logger.debug("Fused QK Norm+RoPE on %s sites", self.matched_count)
-
-    def uuid(self) -> str:
-        return VllmInductorPass.hash_source(self, QkNormRopePattern)
