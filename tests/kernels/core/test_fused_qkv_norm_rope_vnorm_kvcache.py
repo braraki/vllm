@@ -194,7 +194,7 @@ def test_fused_qkv_norm_rope_vnorm_kvcache_matches_reference(
             num_kv_heads=num_kv_heads,
             cache_config=vllm_config.cache_config,
             prefix="model.layers.0.self_attn.attn",
-            attn_backend=AttentionBackendEnum.FLASH_ATTN.get_class(),
+            attn_backend=AttentionBackendEnum.TRITON_ATTN.get_class(),
         )
 
     total_dim = (num_heads + 2 * num_kv_heads) * head_dim

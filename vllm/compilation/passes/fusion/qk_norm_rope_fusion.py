@@ -250,7 +250,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             return False
         if head_dim not in CUDA_512_FUSED_QK_ROPE_HEAD_DIMS:
             return False
-        if "flash_attn" not in impl.__class__.__module__:
+        if "triton_attn" not in impl.__class__.__module__:
             return False
         if getattr(impl, "attn_type", None) != "decoder":
             return False
@@ -331,7 +331,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             if not supported_attn_signatures:
                 logger.warning_once(
                     "Part 4 full post-GEMM fusion not enabled: no supported "
-                    "Gemma4 FlashAttention decoder signatures found"
+                    "Gemma4 TritonAttention decoder signatures found"
                 )
                 return
 

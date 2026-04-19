@@ -4,7 +4,7 @@
 """Benchmark Gemma4 full post-GEMM attention-prep + KV-cache fusion.
 
 This benchmark isolates the non-KV-shared decoder block between the QKV GEMM
-and FlashAttention:
+and TritonAttention:
 
 Baseline:
     q = q_norm(q)
@@ -300,7 +300,7 @@ def _make_case(
             num_kv_heads=num_kv_heads,
             cache_config=vllm_config.cache_config,
             prefix="model.layers.0.self_attn.attn",
-            attn_backend=AttentionBackendEnum.FLASH_ATTN.get_class(),
+            attn_backend=AttentionBackendEnum.TRITON_ATTN.get_class(),
         )
         kv_cache = _allocate_kv_cache(
             attn=attn,

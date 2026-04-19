@@ -380,10 +380,10 @@ def _validate_full_post_gemm_fusion_support(
     impl_module = impl.__class__.__module__
     impl_name = impl.__class__.__name__
 
-    if "flash_attn" not in impl_module:
+    if "triton_attn" not in impl_module:
         raise RuntimeError(
             "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update only "
-            f"supports FlashAttention, got {impl_name}"
+            f"supports TritonAttention, got {impl_name}"
         )
     if getattr(impl, "attn_type", None) != "decoder":
         raise RuntimeError(
@@ -410,7 +410,7 @@ def _validate_full_post_gemm_fusion_support(
     if not kv_cache.is_cuda or kv_cache.device != qkv.device:
         raise RuntimeError("KV cache must be initialized on the same CUDA device")
     if kv_cache.ndim < 4:
-        raise RuntimeError("Unexpected KV cache rank for FlashAttention")
+        raise RuntimeError("Unexpected KV cache rank for TritonAttention")
 
     return resolved_layer_name, attn_layer, kv_cache, layer_slot_mapping
 
@@ -730,7 +730,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
     grid = (num_tokens, total_heads)
     num_warps = 4 if head_dim == 256 else 8
 
-    key_cache, value_cache = kv_cache.unbind(0)
+    key_cache, value_cache = kv_cache.unbind(1)
     use_head_major_layout = key_cache.ndim == 5
     if use_head_major_layout:
         block_size = key_cache.shape[3]
