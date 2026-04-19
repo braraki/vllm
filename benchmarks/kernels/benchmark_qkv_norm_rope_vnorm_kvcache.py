@@ -25,6 +25,7 @@ from pathlib import Path
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.benchmarks.lib.utils import default_vllm_config
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention import Attention
@@ -117,14 +118,15 @@ def _make_rope_cache(
     dtype: torch.dtype,
     is_neox: bool,
 ) -> torch.Tensor:
-    rope = RotaryEmbedding(
-        head_size=head_dim,
-        rotary_dim=head_dim,
-        max_position_embeddings=max_position_embeddings,
-        base=10000.0,
-        is_neox_style=is_neox,
-        dtype=dtype,
-    )
+    with default_vllm_config():
+        rope = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=10000.0,
+            is_neox_style=is_neox,
+            dtype=dtype,
+        )
     return rope.cos_sin_cache.to(device="cuda", dtype=dtype)
 
 
