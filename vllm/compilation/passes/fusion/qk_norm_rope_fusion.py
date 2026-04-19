@@ -106,8 +106,8 @@ class QkNormRopePattern:
         T = 5
         qkv = empty_bf16(T, self.q_size + 2 * self.kv_size)
         positions = empty_i64(T)
-        q_weight = empty_bf16(1, self.head_dim)
-        k_weight = empty_bf16(1, self.head_dim)
+        q_weight = empty_bf16(self.head_dim)
+        k_weight = empty_bf16(self.head_dim)
         if self.rope_flashinfer:
             cos_sin_cache = empty_fp32(4096, self.head_dim)
         else:
@@ -499,8 +499,8 @@ class QKVNormRopeVNormPattern:
         T = 5
         qkv = empty_bf16(T, self.q_size + 2 * self.kv_size)
         positions = empty_i64(T)
-        q_weight = empty_bf16(1, self.head_dim)
-        k_weight = empty_bf16(1, self.head_dim)
+        q_weight = empty_bf16(self.head_dim)
+        k_weight = empty_bf16(self.head_dim)
         cos_sin_cache = empty_bf16(4096, self.head_dim)
         return [
             qkv,
@@ -652,9 +652,9 @@ class QKVNormRopeVNormKVCachePattern:
         T = 5
         qkv = empty_bf16(T, self.q_size + 2 * self.kv_size)
         positions = empty_i64(T)
-        q_weight = empty_bf16(1, self.head_dim)
-        k_weight = empty_bf16(1, self.head_dim)
-        v_weight = empty_bf16(1, self.head_dim)
+        q_weight = empty_bf16(self.head_dim)
+        k_weight = empty_bf16(self.head_dim)
+        v_weight = empty_bf16(self.head_dim)
         cos_sin_cache = empty_bf16(4096, self.head_dim)
         inputs: list = [qkv, positions, q_weight, k_weight, v_weight, cos_sin_cache]
         if _USE_LAYERNAME:
