@@ -722,21 +722,15 @@ class QKVNormRopeVNormKVCachePattern:
                 q_rope = result[1]
                 k_rope = result[2]
 
-                v_by_head = v.view(
-                    *v.shape[:-1], self.num_kv_heads, self.head_dim
-                )
-                v_normed_by_head = vllm.ir.ops.rms_norm(
-                    v_by_head, v_weight, self.eps
-                )
-                v_flat = v_normed_by_head.view(v.shape)
+                v_heads = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+                v_normed_heads = vllm.ir.ops.rms_norm(v_heads, v_weight, self.eps)
 
                 q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
                 k_heads = k_rope.view(-1, self.num_kv_heads, self.head_dim)
-                v_heads = v_flat.view(-1, self.num_kv_heads, self.head_dim)
                 kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
-                    k_heads, v_heads, layer_name
+                    k_heads, v_normed_heads, layer_name
                 )
-                return kv_cache_dummy, q_heads, k_heads, v_heads
+                return kv_cache_dummy, q_heads, k_heads, v_normed_heads
 
             def replacement(
                 qkv: torch.Tensor,
@@ -814,21 +808,15 @@ class QKVNormRopeVNormKVCachePattern:
                 q_rope = result[1]
                 k_rope = result[2]
 
-                v_by_head = v.view(
-                    *v.shape[:-1], self.num_kv_heads, self.head_dim
-                )
-                v_normed_by_head = vllm.ir.ops.rms_norm(
-                    v_by_head, v_weight, self.eps
-                )
-                v_flat = v_normed_by_head.view(v.shape)
+                v_heads = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
+                v_normed_heads = vllm.ir.ops.rms_norm(v_heads, v_weight, self.eps)
 
                 q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
                 k_heads = k_rope.view(-1, self.num_kv_heads, self.head_dim)
-                v_heads = v_flat.view(-1, self.num_kv_heads, self.head_dim)
                 kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
-                    k_heads, v_heads, encoded_layer_name
+                    k_heads, v_normed_heads, encoded_layer_name
                 )
-                return kv_cache_dummy, q_heads, k_heads, v_heads
+                return kv_cache_dummy, q_heads, k_heads, v_normed_heads
 
             def replacement(
                 qkv: torch.Tensor,

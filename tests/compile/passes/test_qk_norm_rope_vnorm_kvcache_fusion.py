@@ -119,12 +119,12 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
         if self.include_v_norm:
-            v = self.v_norm(v.view(-1, self.num_kv_heads, self.head_dim)).view(v.shape)
+            v = self.v_norm(v)
 
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
         kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
             k,
             v,
