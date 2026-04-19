@@ -125,12 +125,28 @@ def _fused_qkv_norm_rope_vnorm_neox_kernel(
     sum_sq = tl.sum(first * first + second * second, axis=0)
     inv_rms = 1.0 / tl.sqrt(sum_sq / head_dim + eps)
 
-    q_weight = tl.load(q_weight_ptr + half_offsets).to(tl.float32)
-    k_weight = tl.load(k_weight_ptr + half_offsets).to(tl.float32)
-    weight = tl.where(is_q, q_weight, tl.where(is_k, k_weight, 1.0))
+    q_weight_first = tl.load(q_weight_ptr + half_offsets).to(tl.float32)
+    q_weight_second = tl.load(q_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
+    k_weight_first = tl.load(k_weight_ptr + half_offsets).to(tl.float32)
+    k_weight_second = tl.load(k_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
 
-    norm_first = first * inv_rms * weight
-    norm_second = second * inv_rms * weight
+    weight_first = tl.where(
+        is_q,
+        q_weight_first,
+        tl.where(is_k, k_weight_first, 1.0),
+    )
+    weight_second = tl.where(
+        is_q,
+        q_weight_second,
+        tl.where(is_k, k_weight_second, 1.0),
+    )
+
+    norm_first = first * inv_rms * weight_first
+    norm_second = second * inv_rms * weight_second
 
     pos_idx = tl.load(position_ids_ptr + token_idx)
     cache_ptr = cos_sin_cache_ptr + pos_idx * stride_cache_row
