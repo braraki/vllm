@@ -59,7 +59,6 @@ def _pattern_debug_enabled() -> bool:
 
 @dataclass
 class Part4FusionCandidate:
-    layer: Attention
     qkv: fx.Node
     positions: fx.Node | Any
     q_weight: fx.Node
@@ -78,11 +77,14 @@ class Part4FusionCandidate:
     q_heads_shape: Any
     k_heads_shape: Any
     v_heads_shape: Any
+    num_heads: int
+    num_kv_heads: int
     q_size: int
     kv_size: int
     head_dim: int
     eps: float
     is_neox: bool
+    resolved_layer_name: str | None
 
 
 def _copy_meta(dst: fx.Node, src: fx.Node) -> None:
@@ -312,6 +314,8 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         )
         self._part4_reject_log_budget = 0
         self._part4_supported_layers: dict[str, Attention] = {}
+        self._part4_supported_signatures: set[tuple[int, int, int]] = set()
+        self._part4_ambiguous_signatures: set[tuple[int, int, int]] = set()
         self._part4_custom_rewrite_enabled = (
             self.experiment_mode == "qkv-norm-rope-vnorm-kvcache-fusion"
         )
@@ -383,6 +387,21 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             self._part4_supported_layers = {
                 layer.layer_name: layer for layer in supported_layers
             }
+            self._part4_supported_signatures = set(supported_attn_signatures)
+            unsupported_signatures = {
+                (layer.head_size, layer.num_heads, layer.num_kv_heads)
+                for layer in attn_layers.values()
+                if not self._supports_part4_full_fusion(layer, layer.head_size)
+            }
+            self._part4_ambiguous_signatures = (
+                self._part4_supported_signatures & unsupported_signatures
+            )
+            if self._part4_ambiguous_signatures:
+                logger.info(
+                    "Part 4 full post-GEMM fusion requires exact layer "
+                    "resolution for ambiguous signatures: %s",
+                    sorted(self._part4_ambiguous_signatures),
+                )
             if _pattern_debug_enabled():
                 logger.debug(
                     "Part 4 full post-GEMM fusion registering signatures: %s",
@@ -523,7 +542,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             graph.erase_node(current)
             stack.extend(inputs)
 
-    def _resolve_part4_layer(self, layer_name: fx.Node | Any) -> Attention | None:
+    def _decode_part4_layer_name(self, layer_name: fx.Node | Any) -> str | None:
         raw_value = layer_name
         if isinstance(layer_name, fx.Node):
             raw_value = layer_name.meta.get("val")
@@ -532,10 +551,9 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         if raw_value is None:
             return None
         try:
-            resolved = _resolve_layer_name(raw_value)
+            return _resolve_layer_name(raw_value)
         except Exception:
             return None
-        return self._part4_supported_layers.get(resolved)
 
     def _match_part4_candidate(
         self, kv_cache_dummy: fx.Node
@@ -557,40 +575,24 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             )
             return None
 
-        layer = self._resolve_part4_layer(layer_name)
-        if layer is None:
-            self._part4_debug_log(
-                "reject: could not resolve supported layer",
-                node=kv_cache_dummy,
-            )
-            return None
-
-        if not self._supports_part4_full_fusion(layer, layer.head_size):
-            self._part4_debug_log(
-                "reject: layer no longer satisfies Part 4 support",
-                layer=layer.layer_name,
-            )
-            return None
-
-        head_dim = layer.head_size
-        num_heads = layer.num_heads
-        num_kv_heads = layer.num_kv_heads
-        q_size = num_heads * head_dim
-        kv_size = num_kv_heads * head_dim
-
         if not is_func(v_heads, RMS_NORM_OP):
             self._part4_debug_log("reject: v path is not weighted rms_norm")
             return None
-        if self._meta_shape(v_heads) is None or self._meta_shape(v_heads)[-2:] != (
-            num_kv_heads,
-            head_dim,
+        v_heads_shape = self._meta_shape(v_heads)
+        if (
+            v_heads_shape is None
+            or len(v_heads_shape) < 2
+            or not isinstance(v_heads_shape[-1], int)
+            or not isinstance(v_heads_shape[-2], int)
         ):
             self._part4_debug_log(
-                "reject: v norm output shape mismatch",
-                shape=self._meta_shape(v_heads),
-                layer=layer.layer_name,
+                "reject: v norm output shape missing or dynamic",
+                shape=v_heads_shape,
             )
             return None
+        num_kv_heads = int(v_heads_shape[-2])
+        head_dim = int(v_heads_shape[-1])
+        kv_size = num_kv_heads * head_dim
 
         v_reshape = v_heads.args[0]
         v_weight = v_heads.args[1]
@@ -603,7 +605,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         ):
             self._part4_debug_log(
                 "reject: invalid v reshape or v weight",
-                layer=layer.layer_name,
+                head_dim=head_dim,
             )
             return None
 
@@ -684,6 +686,78 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             self._part4_debug_log("reject: q/k weighted rms_norm mismatch")
             return None
 
+        q_heads_shape = self._meta_shape(q_heads)
+        k_heads_shape = self._meta_shape(k_heads)
+        if (
+            q_heads_shape is None
+            or len(q_heads_shape) < 2
+            or not isinstance(q_heads_shape[-1], int)
+            or not isinstance(q_heads_shape[-2], int)
+        ):
+            self._part4_debug_log(
+                "reject: q_heads shape missing or dynamic",
+                shape=q_heads_shape,
+            )
+            return None
+        if (
+            k_heads_shape is None
+            or len(k_heads_shape) < 2
+            or not isinstance(k_heads_shape[-1], int)
+            or not isinstance(k_heads_shape[-2], int)
+        ):
+            self._part4_debug_log(
+                "reject: k_heads shape missing or dynamic",
+                shape=k_heads_shape,
+            )
+            return None
+
+        num_heads = int(q_heads_shape[-2])
+        q_head_dim = int(q_heads_shape[-1])
+        k_num_kv_heads = int(k_heads_shape[-2])
+        k_head_dim = int(k_heads_shape[-1])
+        if q_head_dim != head_dim:
+            self._part4_debug_log(
+                "reject: q_heads head_dim mismatch",
+                q_head_dim=q_head_dim,
+                head_dim=head_dim,
+            )
+            return None
+        if k_num_kv_heads != num_kv_heads or k_head_dim != head_dim:
+            self._part4_debug_log(
+                "reject: k_heads shape mismatch",
+                k_heads_shape=k_heads_shape,
+                expected=(num_kv_heads, head_dim),
+            )
+            return None
+
+        signature = (head_dim, num_heads, num_kv_heads)
+        if signature not in self._part4_supported_signatures:
+            self._part4_debug_log(
+                "reject: unsupported Part 4 signature",
+                signature=signature,
+            )
+            return None
+
+        resolved_layer_name = self._decode_part4_layer_name(layer_name)
+        if resolved_layer_name is not None:
+            supported_layer = self._part4_supported_layers.get(resolved_layer_name)
+            if supported_layer is None:
+                self._part4_debug_log(
+                    "reject: resolved layer is not eligible for Part 4",
+                    resolved_layer_name=resolved_layer_name,
+                    signature=signature,
+                )
+                return None
+        elif signature in self._part4_ambiguous_signatures:
+            self._part4_debug_log(
+                "reject: ambiguous signature requires exact layer resolution",
+                signature=signature,
+            )
+            return None
+
+        q_size = num_heads * head_dim
+        layer_debug = resolved_layer_name or f"signature={signature}"
+
         if q_norm.args[2] != eps or k_norm.args[2] != eps:
             self._part4_debug_log(
                 "reject: q/k/v epsilon mismatch",
@@ -736,34 +810,13 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             self._part4_debug_log(
                 "reject: split sizes mismatch",
                 split_sizes=split_sizes,
-                layer=layer.layer_name,
+                layer=layer_debug,
             )
             return None
 
         qkv = split.args[0]
         if not isinstance(qkv, fx.Node):
             self._part4_debug_log("reject: qkv source is not fx.Node")
-            return None
-
-        if self._meta_shape(q_heads) is None or self._meta_shape(q_heads)[-2:] != (
-            num_heads,
-            head_dim,
-        ):
-            self._part4_debug_log(
-                "reject: q_heads shape mismatch",
-                shape=self._meta_shape(q_heads),
-                layer=layer.layer_name,
-            )
-            return None
-        if self._meta_shape(k_heads) is None or self._meta_shape(k_heads)[-2:] != (
-            num_kv_heads,
-            head_dim,
-        ):
-            self._part4_debug_log(
-                "reject: k_heads shape mismatch",
-                shape=self._meta_shape(k_heads),
-                layer=layer.layer_name,
-            )
             return None
 
         if not self._has_expected_users(
@@ -881,14 +934,13 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
 
         self._part4_debug_log(
             "accepted",
-            layer=layer.layer_name,
+            layer=layer_debug,
             head_dim=head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             is_neox=is_neox,
         )
         return Part4FusionCandidate(
-            layer=layer,
             qkv=qkv,
             positions=positions,
             q_weight=q_weight,
@@ -907,11 +959,14 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             q_heads_shape=q_heads.args[1],
             k_heads_shape=k_heads.args[1],
             v_heads_shape=v_reshape.args[1],
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             q_size=q_size,
             kv_size=kv_size,
             head_dim=head_dim,
             eps=float(eps),
             is_neox=is_neox,
+            resolved_layer_name=resolved_layer_name,
         )
 
     def _apply_part4_candidate(
@@ -927,9 +982,9 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                 args=(FUSED_QKV_ROPE_VNORM_KVCACHE_OP,),
                 kwargs={
                     "qkv": candidate.qkv,
-                    "num_heads_q": candidate.layer.num_heads,
-                    "num_heads_k": candidate.layer.num_kv_heads,
-                    "num_heads_v": candidate.layer.num_kv_heads,
+                    "num_heads_q": candidate.num_heads,
+                    "num_heads_k": candidate.num_kv_heads,
+                    "num_heads_v": candidate.num_kv_heads,
                     "head_dim": candidate.head_dim,
                     "eps": candidate.eps,
                     "q_weight": candidate.q_weight,
