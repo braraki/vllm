@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import operator
 from collections.abc import Callable
-from typing import ParamSpec
+from dataclasses import dataclass
+from typing import Any, ParamSpec
 
 import torch
 import torch._inductor.pattern_matcher as pm
@@ -18,11 +20,12 @@ from vllm.model_executor.kernels import qkv_norm_rope_vnorm_triton as _qkv_norm_
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import _USE_LAYERNAME, _encode_layer_name
+from vllm.utils.torch_utils import _USE_LAYERNAME, _encode_layer_name, _resolve_layer_name
 from vllm.utils.torch_utils import is_quantized_kv_cache
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+from ..fx_utils import find_getitem_maybe, is_auto_func, is_func
 from .matcher_utils import MatcherRotaryEmbedding
 from .rms_quant_fusion import empty_bf16, empty_fp32, empty_i64
 
@@ -52,6 +55,39 @@ P = ParamSpec("P")
 
 def _pattern_debug_enabled() -> bool:
     return envs.VLLM_PATTERN_MATCH_DEBUG is not None
+
+
+@dataclass
+class Part4FusionCandidate:
+    layer: Attention
+    qkv: fx.Node
+    positions: fx.Node | Any
+    q_weight: fx.Node
+    k_weight: fx.Node
+    v_weight: fx.Node
+    cos_sin_cache: fx.Node | Any
+    layer_name: fx.Node | Any
+    split: fx.Node
+    q_split: fx.Node
+    k_split: fx.Node
+    v_split: fx.Node
+    q_heads: fx.Node
+    k_heads: fx.Node
+    v_heads: fx.Node
+    kv_cache_dummy: fx.Node
+    q_heads_shape: Any
+    k_heads_shape: Any
+    v_heads_shape: Any
+    q_size: int
+    kv_size: int
+    head_dim: int
+    eps: float
+    is_neox: bool
+
+
+def _copy_meta(dst: fx.Node, src: fx.Node) -> None:
+    if src.meta:
+        dst.meta.update(src.meta)
 
 
 class QkNormRopePattern:
@@ -271,10 +307,15 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="qk_norm_rope_fusion_pass"
         )
-        experiment_mode = str(
+        self.experiment_mode = str(
             config.additional_config.get("gemma4_kernel_experiment", "baseline")
         )
-        if experiment_mode in (
+        self._part4_reject_log_budget = 0
+        self._part4_supported_layers: dict[str, Attention] = {}
+        self._part4_custom_rewrite_enabled = (
+            self.experiment_mode == "qkv-norm-rope-vnorm-kvcache-fusion"
+        )
+        if self.experiment_mode in (
             "qk-norm-rope-fusion-512",
             "qkv-norm-rope-vnorm-fusion",
             "qkv-norm-rope-vnorm-kvcache-fusion",
@@ -299,11 +340,11 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             )
             return
 
-        if experiment_mode == "qkv-norm-rope-vnorm-kvcache-fusion":
+        if self._part4_custom_rewrite_enabled:
             if FUSED_QKV_ROPE_VNORM_KVCACHE_OP is None:
                 logger.warning(
-                    "Skipping qkv-norm-rope-vnorm-kvcache-fusion pattern "
-                    "registration because the fused Part 4 custom op is not "
+                    "Skipping qkv-norm-rope-vnorm-kvcache-fusion custom "
+                    "rewrite because the fused Part 4 custom op is not "
                     "available in torch.ops.vllm."
                 )
                 return
@@ -339,46 +380,14 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                     "Gemma4 TritonAttention decoder signatures found"
                 )
                 return
+            self._part4_supported_layers = {
+                layer.layer_name: layer for layer in supported_layers
+            }
             if _pattern_debug_enabled():
                 logger.debug(
                     "Part 4 full post-GEMM fusion registering signatures: %s",
                     supported_attn_signatures,
                 )
-
-            for epsilon in [1e-5, 1e-6]:
-                for neox in [True, False]:
-                    if _USE_LAYERNAME:
-                        for head_dim, num_heads, num_kv_heads in supported_attn_signatures:
-                            sample_layer = next(
-                                layer
-                                for layer in supported_layers
-                                if (
-                                    layer.head_size,
-                                    layer.num_heads,
-                                    layer.num_kv_heads,
-                                )
-                                == (head_dim, num_heads, num_kv_heads)
-                            )
-                            QKVNormRopeVNormKVCachePattern(
-                                head_dim=head_dim,
-                                num_heads=num_heads,
-                                num_kv_heads=num_kv_heads,
-                                eps=epsilon,
-                                is_neox=neox,
-                                layer_name=sample_layer.layer_name,
-                            ).register(self.patterns)
-                    else:
-                        for layer in supported_layers:
-                            QKVNormRopeVNormKVCachePattern(
-                                head_dim=layer.head_size,
-                                num_heads=layer.num_heads,
-                                num_kv_heads=layer.num_kv_heads,
-                                eps=epsilon,
-                                is_neox=neox,
-                                layer_name=layer.layer_name,
-                            ).register(self.patterns)
-
-            self.dump_patterns(config, self.patterns)
             return
 
         attn_signatures = sorted(
@@ -419,7 +428,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         for epsilon in [1e-5, 1e-6]:
             for neox in [True, False]:
                 for head_dim, num_heads, num_kv_heads in supported_attn_signatures:
-                    if experiment_mode == "qkv-norm-rope-vnorm-fusion":
+                    if self.experiment_mode == "qkv-norm-rope-vnorm-fusion":
                         if FUSED_QKV_ROPE_VNORM_OP is None:
                             logger.warning(
                                 "Skipping qkv-norm-rope-vnorm-fusion pattern "
@@ -456,9 +465,559 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
 
         self.dump_patterns(config, self.patterns)
 
+    def _part4_debug_log(self, message: str, **extra: Any) -> None:
+        if not _pattern_debug_enabled():
+            return
+        if self._part4_reject_log_budget >= 64:
+            return
+        self._part4_reject_log_budget += 1
+        logger.debug(
+            "Part 4 custom rewrite: %s%s",
+            message,
+            f" | {extra}" if extra else "",
+        )
+
+    @staticmethod
+    def _meta_shape(node: fx.Node | Any) -> tuple[Any, ...] | None:
+        if not isinstance(node, fx.Node):
+            return None
+        val = node.meta.get("val")
+        shape = getattr(val, "shape", None)
+        if shape is None:
+            return None
+        return tuple(shape)
+
+    @staticmethod
+    def _meta_last_dim(node: fx.Node | Any) -> Any:
+        shape = QKNormRoPEFusionPass._meta_shape(node)
+        return None if shape is None else shape[-1]
+
+    @staticmethod
+    def _iter_non_output_users(node: fx.Node) -> set[fx.Node]:
+        return {user for user in node.users if user.op != "output"}
+
+    @staticmethod
+    def _output_user_count(node: fx.Node) -> int:
+        return sum(1 for user in node.users if user.op == "output")
+
+    @staticmethod
+    def _has_expected_users(
+        node: fx.Node,
+        *,
+        expected_non_output: set[fx.Node],
+        output_count: int,
+    ) -> bool:
+        return (
+            QKNormRoPEFusionPass._iter_non_output_users(node) == expected_non_output
+            and QKNormRoPEFusionPass._output_user_count(node) == output_count
+        )
+
+    @staticmethod
+    def _erase_if_unused(graph: fx.Graph, node: fx.Node) -> None:
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current._erased or current.users:
+                continue
+            inputs = list(current.all_input_nodes)
+            graph.erase_node(current)
+            stack.extend(inputs)
+
+    def _resolve_part4_layer(self, layer_name: fx.Node | Any) -> Attention | None:
+        raw_value = (
+            layer_name.meta.get("val")
+            if isinstance(layer_name, fx.Node)
+            else layer_name
+        )
+        if raw_value is None:
+            return None
+        try:
+            resolved = _resolve_layer_name(raw_value)
+        except Exception:
+            return None
+        return self._part4_supported_layers.get(resolved)
+
+    def _match_part4_candidate(
+        self, kv_cache_dummy: fx.Node
+    ) -> Part4FusionCandidate | None:
+        if not is_func(
+            kv_cache_dummy, torch.ops.vllm.unified_kv_cache_update.default
+        ):
+            return None
+
+        if len(kv_cache_dummy.args) != 3:
+            self._part4_debug_log("reject: unexpected unified_kv_cache_update args")
+            return None
+
+        k_heads, v_heads, layer_name = kv_cache_dummy.args
+        if not isinstance(k_heads, fx.Node) or not isinstance(v_heads, fx.Node):
+            self._part4_debug_log(
+                "reject: kv cache update inputs are not fx.Nodes",
+                node=kv_cache_dummy,
+            )
+            return None
+
+        layer = self._resolve_part4_layer(layer_name)
+        if layer is None:
+            self._part4_debug_log(
+                "reject: could not resolve supported layer",
+                node=kv_cache_dummy,
+            )
+            return None
+
+        if not self._supports_part4_full_fusion(layer, layer.head_size):
+            self._part4_debug_log(
+                "reject: layer no longer satisfies Part 4 support",
+                layer=layer.layer_name,
+            )
+            return None
+
+        head_dim = layer.head_size
+        num_heads = layer.num_heads
+        num_kv_heads = layer.num_kv_heads
+        q_size = num_heads * head_dim
+        kv_size = num_kv_heads * head_dim
+
+        if not is_func(v_heads, RMS_NORM_OP):
+            self._part4_debug_log("reject: v path is not weighted rms_norm")
+            return None
+        if self._meta_shape(v_heads) is None or self._meta_shape(v_heads)[-2:] != (
+            num_kv_heads,
+            head_dim,
+        ):
+            self._part4_debug_log(
+                "reject: v norm output shape mismatch",
+                shape=self._meta_shape(v_heads),
+                layer=layer.layer_name,
+            )
+            return None
+
+        v_reshape = v_heads.args[0]
+        v_weight = v_heads.args[1]
+        eps = v_heads.args[2]
+        if (
+            not isinstance(v_reshape, fx.Node)
+            or not is_func(v_reshape, torch.ops.aten.reshape.default)
+            or not isinstance(v_weight, fx.Node)
+            or self._meta_last_dim(v_weight) != head_dim
+        ):
+            self._part4_debug_log(
+                "reject: invalid v reshape or v weight",
+                layer=layer.layer_name,
+            )
+            return None
+
+        if not is_func(k_heads, torch.ops.aten.reshape.default):
+            self._part4_debug_log("reject: k_heads is not a reshape")
+            return None
+        k_rope_getitem = k_heads.args[0]
+        if (
+            not isinstance(k_rope_getitem, fx.Node)
+            or not is_func(k_rope_getitem, operator.getitem)
+            or k_rope_getitem.args[1] != 2
+        ):
+            self._part4_debug_log(
+                "reject: k branch does not come from rotary getitem"
+            )
+            return None
+
+        rotary = k_rope_getitem.args[0]
+        if not isinstance(rotary, fx.Node) or not is_auto_func(
+            rotary, torch.ops._C.rotary_embedding.default
+        ):
+            self._part4_debug_log("reject: rotary node mismatch")
+            return None
+
+        q_rope_getitem = find_getitem_maybe(rotary, 1)
+        if q_rope_getitem is None:
+            self._part4_debug_log("reject: missing q rotary getitem")
+            return None
+        q_heads = next(iter(q_rope_getitem.users), None)
+        if (
+            not isinstance(q_heads, fx.Node)
+            or not is_func(q_heads, torch.ops.aten.reshape.default)
+        ):
+            self._part4_debug_log("reject: q_heads is not reshape")
+            return None
+
+        q_flat = rotary.kwargs.get("query")
+        k_flat = rotary.kwargs.get("key")
+        positions = rotary.kwargs.get("positions")
+        cos_sin_cache = rotary.kwargs.get("cos_sin_cache")
+        is_neox = rotary.kwargs.get("is_neox")
+        rotary_head_size = rotary.kwargs.get("head_size")
+
+        if rotary_head_size != head_dim or not isinstance(is_neox, bool):
+            self._part4_debug_log(
+                "reject: rotary metadata mismatch",
+                head_size=rotary_head_size,
+                is_neox=is_neox,
+            )
+            return None
+
+        if (
+            not isinstance(q_flat, fx.Node)
+            or not isinstance(k_flat, fx.Node)
+            or not isinstance(positions, fx.Node)
+            or not is_func(q_flat, torch.ops.aten.reshape.default)
+            or not is_func(k_flat, torch.ops.aten.reshape.default)
+        ):
+            self._part4_debug_log(
+                "reject: q/k flats or positions do not match expected nodes"
+            )
+            return None
+
+        q_norm = q_flat.args[0]
+        k_norm = k_flat.args[0]
+        q_weight = q_norm.args[1] if isinstance(q_norm, fx.Node) else None
+        k_weight = k_norm.args[1] if isinstance(k_norm, fx.Node) else None
+        if (
+            not isinstance(q_norm, fx.Node)
+            or not isinstance(k_norm, fx.Node)
+            or not is_func(q_norm, RMS_NORM_OP)
+            or not is_func(k_norm, RMS_NORM_OP)
+            or not isinstance(q_weight, fx.Node)
+            or not isinstance(k_weight, fx.Node)
+            or self._meta_last_dim(q_weight) != head_dim
+            or self._meta_last_dim(k_weight) != head_dim
+        ):
+            self._part4_debug_log("reject: q/k weighted rms_norm mismatch")
+            return None
+
+        if q_norm.args[2] != eps or k_norm.args[2] != eps:
+            self._part4_debug_log(
+                "reject: q/k/v epsilon mismatch",
+                q_eps=q_norm.args[2],
+                k_eps=k_norm.args[2],
+                v_eps=eps,
+            )
+            return None
+
+        q_reshape = q_norm.args[0]
+        k_reshape = k_norm.args[0]
+        if (
+            not isinstance(q_reshape, fx.Node)
+            or not isinstance(k_reshape, fx.Node)
+            or not is_func(q_reshape, torch.ops.aten.reshape.default)
+            or not is_func(k_reshape, torch.ops.aten.reshape.default)
+        ):
+            self._part4_debug_log("reject: q/k pre-norm reshapes missing")
+            return None
+
+        q_split = q_reshape.args[0]
+        k_split = k_reshape.args[0]
+        v_split = v_reshape.args[0]
+        if (
+            not isinstance(q_split, fx.Node)
+            or not isinstance(k_split, fx.Node)
+            or not isinstance(v_split, fx.Node)
+            or not is_func(q_split, operator.getitem)
+            or not is_func(k_split, operator.getitem)
+            or not is_func(v_split, operator.getitem)
+            or q_split.args[1] != 0
+            or k_split.args[1] != 1
+            or v_split.args[1] != 2
+        ):
+            self._part4_debug_log("reject: split getitems mismatch")
+            return None
+
+        split = q_split.args[0]
+        if (
+            not isinstance(split, fx.Node)
+            or split != k_split.args[0]
+            or split != v_split.args[0]
+            or not is_func(split, torch.ops.aten.split_with_sizes.default)
+        ):
+            self._part4_debug_log("reject: q/k/v do not share split_with_sizes")
+            return None
+
+        split_sizes = tuple(split.args[1])
+        if split_sizes != (q_size, kv_size, kv_size) or split.args[2] != -1:
+            self._part4_debug_log(
+                "reject: split sizes mismatch",
+                split_sizes=split_sizes,
+                layer=layer.layer_name,
+            )
+            return None
+
+        qkv = split.args[0]
+        if not isinstance(qkv, fx.Node):
+            self._part4_debug_log("reject: qkv source is not fx.Node")
+            return None
+
+        if self._meta_shape(q_heads) is None or self._meta_shape(q_heads)[-2:] != (
+            num_heads,
+            head_dim,
+        ):
+            self._part4_debug_log(
+                "reject: q_heads shape mismatch",
+                shape=self._meta_shape(q_heads),
+                layer=layer.layer_name,
+            )
+            return None
+        if self._meta_shape(k_heads) is None or self._meta_shape(k_heads)[-2:] != (
+            num_kv_heads,
+            head_dim,
+        ):
+            self._part4_debug_log(
+                "reject: k_heads shape mismatch",
+                shape=self._meta_shape(k_heads),
+                layer=layer.layer_name,
+            )
+            return None
+
+        if not self._has_expected_users(
+            split,
+            expected_non_output={q_split, k_split, v_split},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: split has unexpected users")
+            return None
+        if not self._has_expected_users(
+            q_split,
+            expected_non_output={q_reshape},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: q split output has unexpected users")
+            return None
+        if not self._has_expected_users(
+            k_split,
+            expected_non_output={k_reshape},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: k split output has unexpected users")
+            return None
+        if not self._has_expected_users(
+            v_split,
+            expected_non_output={v_reshape},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: v split output has unexpected users")
+            return None
+        if not self._has_expected_users(
+            q_reshape,
+            expected_non_output={q_norm},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: q reshape has unexpected users")
+            return None
+        if not self._has_expected_users(
+            k_reshape,
+            expected_non_output={k_norm},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: k reshape has unexpected users")
+            return None
+        if not self._has_expected_users(
+            v_reshape,
+            expected_non_output={v_heads},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: v reshape has unexpected users")
+            return None
+        if not self._has_expected_users(
+            q_norm,
+            expected_non_output={q_flat},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: q norm has unexpected users")
+            return None
+        if not self._has_expected_users(
+            k_norm,
+            expected_non_output={k_flat},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: k norm has unexpected users")
+            return None
+        if not self._has_expected_users(
+            rotary,
+            expected_non_output={q_rope_getitem, k_rope_getitem},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: rotary has unexpected users")
+            return None
+        if not self._has_expected_users(
+            q_rope_getitem,
+            expected_non_output={q_heads},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: q rotary getitem has unexpected users")
+            return None
+        if not self._has_expected_users(
+            k_rope_getitem,
+            expected_non_output={k_heads},
+            output_count=0,
+        ):
+            self._part4_debug_log("reject: k rotary getitem has unexpected users")
+            return None
+        if not self._has_expected_users(
+            q_heads,
+            expected_non_output=set(),
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: q_heads has unexpected users")
+            return None
+        if not self._has_expected_users(
+            k_heads,
+            expected_non_output={kv_cache_dummy},
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: k_heads has unexpected users")
+            return None
+        if not self._has_expected_users(
+            v_heads,
+            expected_non_output={kv_cache_dummy},
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: v_heads has unexpected users")
+            return None
+        if not self._has_expected_users(
+            kv_cache_dummy,
+            expected_non_output=set(),
+            output_count=1,
+        ):
+            self._part4_debug_log("reject: kv cache dummy has unexpected users")
+            return None
+
+        self._part4_debug_log(
+            "accepted",
+            layer=layer.layer_name,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            is_neox=is_neox,
+        )
+        return Part4FusionCandidate(
+            layer=layer,
+            qkv=qkv,
+            positions=positions,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            v_weight=v_weight,
+            cos_sin_cache=cos_sin_cache,
+            layer_name=layer_name,
+            split=split,
+            q_split=q_split,
+            k_split=k_split,
+            v_split=v_split,
+            q_heads=q_heads,
+            k_heads=k_heads,
+            v_heads=v_heads,
+            kv_cache_dummy=kv_cache_dummy,
+            q_heads_shape=q_heads.args[1],
+            k_heads_shape=k_heads.args[1],
+            v_heads_shape=v_reshape.args[1],
+            q_size=q_size,
+            kv_size=kv_size,
+            head_dim=head_dim,
+            eps=float(eps),
+            is_neox=is_neox,
+        )
+
+    def _apply_part4_candidate(
+        self, graph: fx.Graph, candidate: Part4FusionCandidate
+    ) -> None:
+        with graph.inserting_before(candidate.kv_cache_dummy):
+            position_ids = graph.call_function(
+                torch.ops.aten.reshape.default,
+                args=(candidate.positions, [-1]),
+            )
+            fused = graph.call_function(
+                auto_functionalized,
+                args=(FUSED_QKV_ROPE_VNORM_KVCACHE_OP,),
+                kwargs={
+                    "qkv": candidate.qkv,
+                    "num_heads_q": candidate.layer.num_heads,
+                    "num_heads_k": candidate.layer.num_kv_heads,
+                    "num_heads_v": candidate.layer.num_kv_heads,
+                    "head_dim": candidate.head_dim,
+                    "eps": candidate.eps,
+                    "q_weight": candidate.q_weight,
+                    "k_weight": candidate.k_weight,
+                    "v_weight": candidate.v_weight,
+                    "cos_sin_cache": candidate.cos_sin_cache,
+                    "is_neox": candidate.is_neox,
+                    "position_ids": position_ids,
+                    "layer_name": candidate.layer_name,
+                    "forced_token_heads_per_warp": -1,
+                },
+            )
+            fused_dummy = graph.call_function(operator.getitem, args=(fused, 0))
+            fused_qkv = graph.call_function(operator.getitem, args=(fused, 1))
+            split = graph.call_function(
+                torch.ops.aten.split_with_sizes.default,
+                args=(
+                    fused_qkv,
+                    [candidate.q_size, candidate.kv_size, candidate.kv_size],
+                    -1,
+                ),
+            )
+            q_flat = graph.call_function(operator.getitem, args=(split, 0))
+            k_flat = graph.call_function(operator.getitem, args=(split, 1))
+            v_flat = graph.call_function(operator.getitem, args=(split, 2))
+            q_heads = graph.call_function(
+                torch.ops.aten.reshape.default,
+                args=(q_flat, candidate.q_heads_shape),
+            )
+            k_heads = graph.call_function(
+                torch.ops.aten.reshape.default,
+                args=(k_flat, candidate.k_heads_shape),
+            )
+            v_heads = graph.call_function(
+                torch.ops.aten.reshape.default,
+                args=(v_flat, candidate.v_heads_shape),
+            )
+
+        _copy_meta(
+            position_ids,
+            candidate.positions
+            if isinstance(candidate.positions, fx.Node)
+            else candidate.qkv,
+        )
+        _copy_meta(fused_dummy, candidate.kv_cache_dummy)
+        _copy_meta(fused_qkv, candidate.qkv)
+        _copy_meta(q_flat, candidate.q_split)
+        _copy_meta(k_flat, candidate.k_split)
+        _copy_meta(v_flat, candidate.v_split)
+        _copy_meta(q_heads, candidate.q_heads)
+        _copy_meta(k_heads, candidate.k_heads)
+        _copy_meta(v_heads, candidate.v_heads)
+
+        candidate.q_heads.replace_all_uses_with(q_heads)
+        candidate.k_heads.replace_all_uses_with(k_heads)
+        candidate.v_heads.replace_all_uses_with(v_heads)
+        candidate.kv_cache_dummy.replace_all_uses_with(fused_dummy)
+
+        for node in (
+            candidate.kv_cache_dummy,
+            candidate.q_heads,
+            candidate.k_heads,
+            candidate.v_heads,
+        ):
+            self._erase_if_unused(graph, node)
+
+    def _rewrite_part4(self, graph: fx.Graph) -> int:
+        matched = 0
+        for node in list(graph.nodes):
+            if node._erased or not is_func(
+                node, torch.ops.vllm.unified_kv_cache_update.default
+            ):
+                continue
+            candidate = self._match_part4_candidate(node)
+            if candidate is None:
+                continue
+            self._apply_part4_candidate(graph, candidate)
+            matched += 1
+        return matched
+
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
+        self._part4_reject_log_budget = 0
+        if self._part4_custom_rewrite_enabled:
+            self.matched_count = self._rewrite_part4(graph)
+        else:
+            self.matched_count = self.patterns.apply(graph)
+        VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
         logger.debug("Fused QK Norm+RoPE on %s sites", self.matched_count)
 
     def uuid(self) -> str:

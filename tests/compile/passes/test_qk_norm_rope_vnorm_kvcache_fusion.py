@@ -76,6 +76,7 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
         vllm_config: VllmConfig,
         dtype: torch.dtype,
         include_v_norm: bool = True,
+        extra_q_user: bool = False,
         prefix: str = "model.layers.0.self_attn.attn",
         attn_backend=AttentionBackendEnum.TRITON_ATTN.get_class(),
     ) -> None:
@@ -87,6 +88,7 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
         self.kv_size = num_kv_heads * head_dim
         self.eps = eps
         self.include_v_norm = include_v_norm
+        self.extra_q_user = extra_q_user
         self.layer_name = prefix
 
         self.attn = Attention(
@@ -137,6 +139,9 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
             device=q.device,
         )
         output = output.view(-1, self.num_heads, self.head_dim)
+        if self.extra_q_user:
+            q_summary = q.sum(dim=1, keepdim=True)
+            output = output + q_summary - q_summary
         kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
             k,
             v,
@@ -300,6 +305,83 @@ def test_qkv_norm_rope_vnorm_kvcache_does_not_match_without_v_norm(dtype):
             vllm_config=vllm_config,
             dtype=dtype,
             include_v_norm=False,
+        )
+
+        noop_pass = NoOpEliminationPass(vllm_config)
+        coalesce_pass = SplitCoalescingPass(vllm_config)
+        fusion_pass = QKNormRoPEFusionPass(vllm_config)
+        cleanup_pass = PostCleanupPass(vllm_config)
+        backend = TestBackend(noop_pass, coalesce_pass, fusion_pass, cleanup_pass)
+
+        qkv = torch.randn(T, model.q_size + 2 * model.kv_size)
+        pos = torch.arange(T, dtype=torch.long, device=qkv.device)
+        model.attn.kv_cache = _allocate_kv_cache(
+            model.attn,
+            block_size=vllm_config.cache_config.block_size,
+            num_tokens=T,
+            dtype=dtype,
+            device=qkv.device,
+        )
+
+        with set_forward_context(
+            None,
+            vllm_config,
+            slot_mapping={model.layer_name: slot_mapping},
+        ):
+            torch._dynamo.mark_dynamic(qkv, 0)
+            torch._dynamo.mark_dynamic(pos, 0)
+            model_fused = torch.compile(model, backend=backend)
+            _ = model_fused(qkv, pos)
+
+        assert fusion_pass.matched_count == 0
+        assert backend.op_count(FUSED_QKV_ROPE_VNORM_KVCACHE_OP) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Part 4 compile-pass coverage is CUDA-only",
+)
+def test_qkv_norm_rope_vnorm_kvcache_skips_extra_q_user(dtype):
+    if FUSED_QKV_ROPE_VNORM_KVCACHE_OP is None:
+        pytest.skip("Part 4 fused post-GEMM custom op not available")
+
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(0)
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=["+rms_norm", "+rotary_embedding"],
+            pass_config=PassConfig(
+                enable_qk_norm_rope_fusion=True,
+                eliminate_noops=True,
+            ),
+        ),
+        additional_config={
+            "gemma4_kernel_experiment": "qkv-norm-rope-vnorm-kvcache-fusion"
+        },
+    )
+
+    T = 5
+    slot_mapping = torch.arange(T, dtype=torch.long, device="cuda")
+
+    with (
+        set_current_vllm_config(vllm_config),
+        vllm_config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        model = QKVNormRoPEVNormKVCacheTestModel(
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            eps=1e-6,
+            is_neox=True,
+            vllm_config=vllm_config,
+            dtype=dtype,
+            extra_q_user=True,
         )
 
         noop_pass = NoOpEliminationPass(vllm_config)
