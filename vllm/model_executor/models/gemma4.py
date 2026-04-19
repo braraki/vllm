@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+from contextlib import nullcontext
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -35,7 +36,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import GeluAndMul
+from vllm.model_executor.layers.activation import GeluAndMul, PLEGeluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -59,6 +60,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 
 from .interfaces import (
     EagleModelMixin,
@@ -77,6 +79,23 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_PRE_FF_RESIDUAL_NORM_BASELINE_SCOPE = (
+    "gemma4.decoder.pre_ff_residual_norm:baseline"
+)
+_PRE_FF_RESIDUAL_NORM_FUSION_SCOPE = (
+    "gemma4.decoder.pre_ff_residual_norm:decoder_residual_fusion"
+)
+_PLE_GELU_AND_MUL_BASELINE_SCOPE = "gemma4.decoder.ple_gelu_and_mul:baseline"
+_PLE_GELU_AND_MUL_FUSION_SCOPE = (
+    "gemma4.decoder.ple_gelu_and_mul:ple_gelu_and_mul_fusion"
+)
+_ATTENTION_PREP_BASELINE_SCOPE = "gemma4.attention.prep:baseline"
+_ATTENTION_PREP_QK_LT_512_SCOPE = "gemma4.attention.prep:qk_norm_rope_fusion_lt_512"
+_ATTENTION_PREP_QK_512_SCOPE = "gemma4.attention.prep:qk_norm_rope_fusion_512"
+_ATTENTION_PREP_QKV_VNORM_SCOPE = (
+    "gemma4.attention.prep:qkv_norm_rope_vnorm_fusion"
+)
 
 
 def _get_text_config(config):
@@ -268,12 +287,14 @@ class Gemma4Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         attn_logits_soft_cap: float | None = None,
+        kernel_experiment: str = "baseline",
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = hidden_size
         self.use_k_eq_v = use_k_eq_v
+        self.kernel_experiment = kernel_experiment
 
         tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -392,6 +413,15 @@ class Gemma4Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+    def _attention_prep_scope(self) -> str:
+        if self.kernel_experiment == "qk-norm-rope-fusion-lt-512":
+            return _ATTENTION_PREP_QK_LT_512_SCOPE
+        if self.kernel_experiment == "qk-norm-rope-fusion-512":
+            return _ATTENTION_PREP_QK_512_SCOPE
+        if self.kernel_experiment == "qkv-norm-rope-vnorm-fusion":
+            return _ATTENTION_PREP_QKV_VNORM_SCOPE
+        return _ATTENTION_PREP_BASELINE_SCOPE
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -403,25 +433,30 @@ class Gemma4Attention(nn.Module):
         # qkv_proj, so V == K automatically.
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        scope_context = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else record_function_or_nullcontext(self._attention_prep_scope())
+        )
+        with scope_context:
+            # Q norm (always applied)
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
 
-        # Q norm (always applied)
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
+            if not self.is_kv_shared_layer:
+                # Non-shared: apply K norm + RoPE, V norm
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
 
-        if not self.is_kv_shared_layer:
-            # Non-shared: apply K norm + RoPE, V norm
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
-        else:
-            # Shared: only apply RoPE to Q
-            q = self.rotary_emb(positions, q, k)[0]
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+            else:
+                # Shared: only apply RoPE to Q
+                q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -436,11 +471,18 @@ class Gemma4DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        kernel_experiment: str = "baseline",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.hidden_size_per_layer_input = getattr(
             config, "hidden_size_per_layer_input", 0
+        )
+        self.use_decoder_residual_fusion = (
+            kernel_experiment == "decoder-residual-fusion"
+        )
+        self.use_ple_gelu_and_mul_fusion = (
+            kernel_experiment == "ple-gelu-and-mul-fusion"
         )
 
         layer_idx = extract_layer_index(prefix)
@@ -480,6 +522,7 @@ class Gemma4DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
+            kernel_experiment=kernel_experiment,
             prefix=f"{prefix}.self_attn",
         )
 
@@ -575,13 +618,37 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+            self.ple_gelu_and_mul = (
+                PLEGeluAndMul() if self.use_ple_gelu_and_mul_fusion else None
+            )
         else:
             self.per_layer_input_gate = None
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
+            self.ple_gelu_and_mul = None
 
         # Layer scalar (loaded from checkpoint) — applies to ALL text layers
         self.register_buffer("layer_scalar", torch.ones(1))
+
+    def _apply_ple_gelu_and_mul(
+        self, gate: torch.Tensor, per_layer_input: torch.Tensor
+    ) -> torch.Tensor:
+        ple_scope = (
+            _PLE_GELU_AND_MUL_FUSION_SCOPE
+            if self.use_ple_gelu_and_mul_fusion
+            else _PLE_GELU_AND_MUL_BASELINE_SCOPE
+        )
+        scope_context = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else record_function_or_nullcontext(ple_scope)
+        )
+        with scope_context:
+            if self.use_ple_gelu_and_mul_fusion:
+                assert self.ple_gelu_and_mul is not None
+                return self.ple_gelu_and_mul(gate, per_layer_input)
+            gate = torch.nn.functional.gelu(gate, approximate="tanh")
+            return gate * per_layer_input
 
     def forward(
         self,
@@ -605,11 +672,27 @@ class Gemma4DecoderLayer(nn.Module):
         )
 
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-        residual = hidden_states
+        pre_ff_scope = (
+            _PRE_FF_RESIDUAL_NORM_FUSION_SCOPE
+            if self.use_decoder_residual_fusion
+            else _PRE_FF_RESIDUAL_NORM_BASELINE_SCOPE
+        )
+        scope_context = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else record_function_or_nullcontext(pre_ff_scope)
+        )
+        with scope_context:
+            if self.use_decoder_residual_fusion:
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
+            else:
+                hidden_states = hidden_states + residual
+                residual = hidden_states
+                hidden_states = self.pre_feedforward_layernorm(hidden_states)
 
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
@@ -631,8 +714,7 @@ class Gemma4DecoderLayer(nn.Module):
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
             gate = self.per_layer_input_gate(hidden_states)
-            gate = torch.nn.functional.gelu(gate, approximate="tanh")
-            gated_per_layer = gate * per_layer_input
+            gated_per_layer = self._apply_ple_gelu_and_mul(gate, per_layer_input)
             per_layer_contribution = self.per_layer_projection(gated_per_layer)
             per_layer_contribution = self.post_per_layer_input_norm(
                 per_layer_contribution
@@ -851,8 +933,18 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         config = _get_text_config(vllm_config.model_config.hf_config)
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        self.gemma4_kernel_experiment = str(
+            vllm_config.additional_config.get(
+                "gemma4_kernel_experiment", "baseline"
+            )
+        )
         self.config = config
         self.quant_config = quant_config
+        logger.info_once(
+            "Gemma4 kernel experiment mode: %s",
+            self.gemma4_kernel_experiment,
+            scope="local",
+        )
 
         # PLE config values (default to 0 if not present — disables PLE)
         self.hidden_size_per_layer_input = getattr(
@@ -935,6 +1027,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
+                kernel_experiment=self.gemma4_kernel_experiment,
             ),
             prefix=f"{prefix}.layers",
         )

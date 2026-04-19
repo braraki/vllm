@@ -133,6 +133,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
 
+  // Activation function used in Gemma4 PLE: gelu_tanh(gate) * value.
+  ops.def("ple_gelu_tanh_and_mul(Tensor! out, Tensor gate, Tensor value) -> ()");
+  ops.impl("ple_gelu_tanh_and_mul", torch::kCUDA, &ple_gelu_tanh_and_mul);
+
   // FATReLU implementation.
   ops.def("fatrelu_and_mul(Tensor! out, Tensor input, float threshold) -> ()");
   ops.impl("fatrelu_and_mul", torch::kCUDA, &fatrelu_and_mul);
@@ -176,6 +180,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_neox, Tensor position_ids, "
       "int forced_token_heads_per_warp=-1) -> ()");
   ops.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
+
+  ops.def(
+      "fused_qkv_norm_rope_vnorm(Tensor! qkv, int num_heads_q, "
+      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
+      "bool is_neox, Tensor position_ids, "
+      "int forced_token_heads_per_warp=-1) -> ()");
+  ops.impl("fused_qkv_norm_rope_vnorm", torch::kCUDA,
+           &fused_qkv_norm_rope_vnorm);
 
   // Apply repetition penalties to logits in-place
   ops.def(

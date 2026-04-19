@@ -220,6 +220,24 @@ def test_media_io_kwargs_parser(arg, expected):
     assert args.media_io_kwargs == expected
 
 
+def test_gemma4_async_output_sync_reduction_experiment_flag():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--gemma4-kernel-experiment", "async-output-sync-reduction"]
+    )
+
+    assert args.gemma4_kernel_experiment == "async-output-sync-reduction"
+
+
+def test_gemma4_ple_gelu_and_mul_fusion_experiment_flag():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        ["--gemma4-kernel-experiment", "ple-gelu-and-mul-fusion"]
+    )
+
+    assert args.gemma4_kernel_experiment == "ple-gelu-and-mul-fusion"
+
+
 @pytest.mark.parametrize(
     ("args", "expected"),
     [

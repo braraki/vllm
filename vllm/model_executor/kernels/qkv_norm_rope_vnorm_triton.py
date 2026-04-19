@@ -1,0 +1,918 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import torch
+
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _resolve_layer_name,
+    direct_register_custom_op,
+    is_quantized_kv_cache,
+)
+
+_SUPPORTED_HEAD_DIMS = {256, 512}
+_SUPPORTED_NUM_HEADS_Q = 8
+_SUPPORTED_NUM_HEADS_KV = 1
+
+
+def _raise_if_unsupported(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor | None,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> None:
+    if not HAS_TRITON:
+        raise RuntimeError(
+            "fused_qkv_norm_rope_vnorm requires Triton, but Triton is not available"
+        )
+    if not current_platform.is_cuda():
+        raise RuntimeError("fused_qkv_norm_rope_vnorm Triton path is CUDA-only")
+    if not qkv.is_cuda:
+        raise RuntimeError("qkv must be a CUDA tensor")
+    if not q_weight.is_cuda or not k_weight.is_cuda:
+        raise RuntimeError("q_weight and k_weight must be CUDA tensors")
+    if v_weight is not None and not v_weight.is_cuda:
+        raise RuntimeError("v_weight must be a CUDA tensor")
+    if not cos_sin_cache.is_cuda or not position_ids.is_cuda:
+        raise RuntimeError("cos_sin_cache and position_ids must be CUDA tensors")
+    if (
+        q_weight.device != qkv.device
+        or k_weight.device != qkv.device
+        or (v_weight is not None and v_weight.device != qkv.device)
+        or cos_sin_cache.device != qkv.device
+        or position_ids.device != qkv.device
+    ):
+        raise RuntimeError("All fused_qkv_norm_rope_vnorm inputs must share a device")
+    if qkv.dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(
+            f"Unsupported dtype for fused_qkv_norm_rope_vnorm: {qkv.dtype}"
+        )
+    if qkv.dim() != 2:
+        raise RuntimeError("qkv must be a 2D packed tensor")
+    if not qkv.is_contiguous():
+        raise RuntimeError("qkv must be contiguous")
+    if position_ids.dim() != 1 or not position_ids.is_contiguous():
+        raise RuntimeError("position_ids must be a contiguous 1D tensor")
+    if position_ids.dtype != torch.long:
+        raise RuntimeError("position_ids must be torch.int64")
+    if q_weight.dim() != 1 or k_weight.dim() != 1:
+        raise RuntimeError("q_weight and k_weight must be 1D tensors")
+    if v_weight is not None and v_weight.dim() != 1:
+        raise RuntimeError("v_weight must be a 1D tensor")
+    if not q_weight.is_contiguous() or not k_weight.is_contiguous():
+        raise RuntimeError("q_weight and k_weight must be contiguous")
+    if v_weight is not None and not v_weight.is_contiguous():
+        raise RuntimeError("v_weight must be contiguous")
+    if q_weight.dtype != qkv.dtype or k_weight.dtype != qkv.dtype:
+        raise RuntimeError("q_weight and k_weight must match qkv dtype")
+    if v_weight is not None and v_weight.dtype != qkv.dtype:
+        raise RuntimeError("v_weight must match qkv dtype")
+    if cos_sin_cache.dim() != 2 or not cos_sin_cache.is_contiguous():
+        raise RuntimeError("cos_sin_cache must be a contiguous 2D tensor")
+    if cos_sin_cache.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise RuntimeError("cos_sin_cache must be float32, float16, or bfloat16")
+    if cos_sin_cache.size(1) != head_dim:
+        raise RuntimeError(
+            "Gemma4 Triton fused_qkv_norm_rope_vnorm requires rotary_dim == head_dim"
+        )
+    if num_heads_q != _SUPPORTED_NUM_HEADS_Q:
+        raise RuntimeError(
+            "Gemma4 Triton fused_qkv_norm_rope_vnorm requires num_heads_q == 8"
+        )
+    if (
+        num_heads_k != _SUPPORTED_NUM_HEADS_KV
+        or num_heads_v != _SUPPORTED_NUM_HEADS_KV
+    ):
+        raise RuntimeError(
+            "Gemma4 Triton fused_qkv_norm_rope_vnorm requires num_heads_k == num_heads_v == 1"
+        )
+    if head_dim not in _SUPPORTED_HEAD_DIMS:
+        raise RuntimeError(
+            f"Unsupported head_dim for Triton fused_qkv_norm_rope_vnorm: {head_dim}"
+        )
+    if q_weight.numel() != head_dim or k_weight.numel() != head_dim:
+        raise RuntimeError("q_weight and k_weight sizes must match head_dim")
+    if v_weight is not None and v_weight.numel() != head_dim:
+        raise RuntimeError("v_weight size must match head_dim")
+    total_dim = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+    if qkv.size(1) != total_dim:
+        raise RuntimeError("qkv packed width does not match heads * head_dim")
+    if position_ids.numel() != qkv.size(0):
+        raise RuntimeError("position_ids length must match qkv rows")
+
+
+@triton.jit
+def _fused_qkv_norm_rope_vnorm_neox_kernel(
+    qkv_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    position_ids_ptr,
+    stride_qkv_row,
+    stride_cache_row,
+    q_size,
+    k_offset,
+    head_dim,
+    eps,
+    HALF_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    slot_idx = tl.program_id(axis=1)
+
+    row_ptr = qkv_ptr + token_idx * stride_qkv_row
+    is_q = slot_idx < 8
+    is_k = slot_idx == 8
+    head_offset = tl.where(is_q, slot_idx * head_dim, tl.where(is_k, q_size, k_offset))
+    base_ptr = row_ptr + head_offset
+
+    half_offsets = tl.arange(0, HALF_BLOCK)
+    first_ptrs = base_ptr + half_offsets
+    second_ptrs = first_ptrs + HALF_BLOCK
+
+    first = tl.load(first_ptrs).to(tl.float32)
+    second = tl.load(second_ptrs).to(tl.float32)
+    sum_sq = tl.sum(first * first + second * second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sum_sq / head_dim + eps)
+
+    q_weight_first = tl.load(q_weight_ptr + half_offsets).to(tl.float32)
+    q_weight_second = tl.load(q_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
+    k_weight_first = tl.load(k_weight_ptr + half_offsets).to(tl.float32)
+    k_weight_second = tl.load(k_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
+
+    weight_first = tl.where(
+        is_q,
+        q_weight_first,
+        tl.where(is_k, k_weight_first, 1.0),
+    )
+    weight_second = tl.where(
+        is_q,
+        q_weight_second,
+        tl.where(is_k, k_weight_second, 1.0),
+    )
+
+    norm_first = first * inv_rms * weight_first
+    norm_second = second * inv_rms * weight_second
+
+    pos_idx = tl.load(position_ids_ptr + token_idx)
+    cache_ptr = cos_sin_cache_ptr + pos_idx * stride_cache_row
+    cos = tl.load(cache_ptr + half_offsets).to(tl.float32)
+    sin = tl.load(cache_ptr + HALF_BLOCK + half_offsets).to(tl.float32)
+
+    rope_first = norm_first * cos - norm_second * sin
+    rope_second = norm_second * cos + norm_first * sin
+    qk_mask = slot_idx < 9
+
+    tl.store(
+        first_ptrs,
+        tl.where(qk_mask, rope_first, norm_first),
+    )
+    tl.store(
+        second_ptrs,
+        tl.where(qk_mask, rope_second, norm_second),
+    )
+
+
+@triton.jit
+def _fused_qkv_norm_rope_vnorm_gptj_kernel(
+    qkv_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    position_ids_ptr,
+    stride_qkv_row,
+    stride_cache_row,
+    q_size,
+    k_offset,
+    head_dim,
+    eps,
+    HALF_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    slot_idx = tl.program_id(axis=1)
+
+    row_ptr = qkv_ptr + token_idx * stride_qkv_row
+    is_q = slot_idx < 8
+    is_k = slot_idx == 8
+    head_offset = tl.where(is_q, slot_idx * head_dim, tl.where(is_k, q_size, k_offset))
+    base_ptr = row_ptr + head_offset
+
+    pair_offsets = tl.arange(0, HALF_BLOCK)
+    even_ptrs = base_ptr + pair_offsets * 2
+    odd_ptrs = even_ptrs + 1
+
+    even = tl.load(even_ptrs).to(tl.float32)
+    odd = tl.load(odd_ptrs).to(tl.float32)
+    sum_sq = tl.sum(even * even + odd * odd, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sum_sq / head_dim + eps)
+
+    even_cols = pair_offsets * 2
+    odd_cols = even_cols + 1
+    q_weight_even = tl.load(q_weight_ptr + even_cols).to(tl.float32)
+    q_weight_odd = tl.load(q_weight_ptr + odd_cols).to(tl.float32)
+    k_weight_even = tl.load(k_weight_ptr + even_cols).to(tl.float32)
+    k_weight_odd = tl.load(k_weight_ptr + odd_cols).to(tl.float32)
+
+    weight_even = tl.where(is_q, q_weight_even, tl.where(is_k, k_weight_even, 1.0))
+    weight_odd = tl.where(is_q, q_weight_odd, tl.where(is_k, k_weight_odd, 1.0))
+
+    norm_even = even * inv_rms * weight_even
+    norm_odd = odd * inv_rms * weight_odd
+
+    pos_idx = tl.load(position_ids_ptr + token_idx)
+    cache_ptr = cos_sin_cache_ptr + pos_idx * stride_cache_row
+    cos = tl.load(cache_ptr + pair_offsets).to(tl.float32)
+    sin = tl.load(cache_ptr + HALF_BLOCK + pair_offsets).to(tl.float32)
+
+    rope_even = norm_even * cos - norm_odd * sin
+    rope_odd = norm_odd * cos + norm_even * sin
+    qk_mask = slot_idx < 9
+
+    tl.store(
+        even_ptrs,
+        tl.where(qk_mask, rope_even, norm_even),
+    )
+    tl.store(
+        odd_ptrs,
+        tl.where(qk_mask, rope_odd, norm_odd),
+    )
+
+
+def _fused_qkv_norm_rope_vnorm_impl(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    forced_token_heads_per_warp: int = -1,
+) -> None:
+    del forced_token_heads_per_warp
+    _raise_if_unsupported(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        q_weight,
+        k_weight,
+        None,
+        cos_sin_cache,
+        position_ids,
+    )
+
+    num_tokens = qkv.size(0)
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+    q_size = num_heads_q * head_dim
+    k_offset = q_size + num_heads_k * head_dim
+    grid = (num_tokens, total_heads)
+    num_warps = 4 if head_dim == 256 else 8
+
+    if is_neox:
+        _fused_qkv_norm_rope_vnorm_neox_kernel[grid](
+            qkv,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            position_ids,
+            qkv.stride(0),
+            cos_sin_cache.stride(0),
+            q_size,
+            k_offset,
+            head_dim,
+            eps,
+            HALF_BLOCK=head_dim // 2,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+    else:
+        _fused_qkv_norm_rope_vnorm_gptj_kernel[grid](
+            qkv,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            position_ids,
+            qkv.stride(0),
+            cos_sin_cache.stride(0),
+            q_size,
+            k_offset,
+            head_dim,
+            eps,
+            HALF_BLOCK=head_dim // 2,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+
+
+def _fused_qkv_norm_rope_vnorm_fake(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    forced_token_heads_per_warp: int = -1,
+) -> None:
+    del (
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+        forced_token_heads_per_warp,
+    )
+    return None
+
+
+direct_register_custom_op(
+    op_name="fused_qkv_norm_rope_vnorm",
+    op_func=_fused_qkv_norm_rope_vnorm_impl,
+    mutates_args=["qkv"],
+    fake_impl=_fused_qkv_norm_rope_vnorm_fake,
+)
+
+
+def _validate_full_post_gemm_fusion_support(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    layer_name: LayerNameType,
+):
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+
+    _raise_if_unsupported(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos_sin_cache,
+        position_ids,
+    )
+
+    resolved_layer_name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        resolved_layer_name
+    )
+    impl = attn_layer.impl
+    impl_module = impl.__class__.__module__
+    impl_name = impl.__class__.__name__
+
+    if "triton_attn" not in impl_module:
+        raise RuntimeError(
+            "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update only "
+            f"supports TritonAttention, got {impl_name}"
+        )
+    if getattr(impl, "attn_type", None) != "decoder":
+        raise RuntimeError(
+            "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update only "
+            "supports decoder attention"
+        )
+    if getattr(impl, "dcp_world_size", 1) != 1:
+        raise RuntimeError(
+            "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update requires "
+            "dcp_world_size == 1"
+        )
+    if is_quantized_kv_cache(getattr(impl, "kv_cache_dtype", "auto")):
+        raise RuntimeError(
+            "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update does not "
+            "support quantized KV cache in v1"
+        )
+    if attn_layer.kv_sharing_target_layer_name is not None:
+        raise RuntimeError(
+            "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update does not "
+            "support KV-shared layers"
+        )
+    if layer_slot_mapping is not None:
+        if kv_cache is None:
+            raise RuntimeError("Attention layer KV cache is not initialized")
+        if not kv_cache.is_cuda or kv_cache.device != qkv.device:
+            raise RuntimeError("KV cache must be initialized on the same CUDA device")
+        if kv_cache.ndim < 4:
+            raise RuntimeError("Unexpected KV cache rank for TritonAttention")
+
+    return resolved_layer_name, attn_layer, kv_cache, layer_slot_mapping
+
+
+@triton.jit
+def _fused_qkv_norm_rope_vnorm_kvcache_neox_kernel(
+    qkv_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    v_weight_ptr,
+    cos_sin_cache_ptr,
+    position_ids_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    stride_qkv_row,
+    stride_cache_row,
+    key_cache_block_stride,
+    key_cache_page_stride,
+    key_cache_dim_stride,
+    value_cache_block_stride,
+    value_cache_page_stride,
+    value_cache_dim_stride,
+    q_size,
+    k_offset,
+    head_dim,
+    eps,
+    block_size,
+    cache_x,
+    USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    slot_idx = tl.program_id(axis=1)
+
+    row_ptr = qkv_ptr + token_idx * stride_qkv_row
+    is_q = slot_idx < 8
+    is_k = slot_idx == 8
+    is_v = slot_idx == 9
+    head_offset = tl.where(is_q, slot_idx * head_dim, tl.where(is_k, q_size, k_offset))
+    base_ptr = row_ptr + head_offset
+
+    half_offsets = tl.arange(0, HALF_BLOCK)
+    first_ptrs = base_ptr + half_offsets
+    second_ptrs = first_ptrs + HALF_BLOCK
+
+    first = tl.load(first_ptrs).to(tl.float32)
+    second = tl.load(second_ptrs).to(tl.float32)
+    sum_sq = tl.sum(first * first + second * second, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sum_sq / head_dim + eps)
+
+    q_weight_first = tl.load(q_weight_ptr + half_offsets).to(tl.float32)
+    q_weight_second = tl.load(q_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
+    k_weight_first = tl.load(k_weight_ptr + half_offsets).to(tl.float32)
+    k_weight_second = tl.load(k_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
+    v_weight_first = tl.load(v_weight_ptr + half_offsets).to(tl.float32)
+    v_weight_second = tl.load(v_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
+
+    weight_first = tl.where(
+        is_q,
+        q_weight_first,
+        tl.where(is_k, k_weight_first, v_weight_first),
+    )
+    weight_second = tl.where(
+        is_q,
+        q_weight_second,
+        tl.where(is_k, k_weight_second, v_weight_second),
+    )
+
+    norm_first = first * inv_rms * weight_first
+    norm_second = second * inv_rms * weight_second
+
+    pos_idx = tl.load(position_ids_ptr + token_idx)
+    cache_ptr = cos_sin_cache_ptr + pos_idx * stride_cache_row
+    cos = tl.load(cache_ptr + half_offsets).to(tl.float32)
+    sin = tl.load(cache_ptr + HALF_BLOCK + half_offsets).to(tl.float32)
+
+    rope_first = norm_first * cos - norm_second * sin
+    rope_second = norm_second * cos + norm_first * sin
+    qk_mask = slot_idx < 9
+    out_first = tl.where(qk_mask, rope_first, norm_first)
+    out_second = tl.where(qk_mask, rope_second, norm_second)
+
+    tl.store(first_ptrs, out_first)
+    tl.store(second_ptrs, out_second)
+
+    slot = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+    valid_slot = slot >= 0
+    block_idx = slot // block_size
+    block_offset = slot % block_size
+
+    first_dim = half_offsets
+    second_dim = HALF_BLOCK + half_offsets
+
+    if USE_HEAD_MAJOR_LAYOUT:
+        key_first_idx = (
+            block_idx * key_cache_block_stride
+            + (first_dim // cache_x) * key_cache_dim_stride
+            + block_offset * cache_x
+            + (first_dim % cache_x)
+        )
+        key_second_idx = (
+            block_idx * key_cache_block_stride
+            + (second_dim // cache_x) * key_cache_dim_stride
+            + block_offset * cache_x
+            + (second_dim % cache_x)
+        )
+        value_first_idx = (
+            block_idx * value_cache_block_stride
+            + first_dim * value_cache_dim_stride
+            + block_offset
+        )
+        value_second_idx = (
+            block_idx * value_cache_block_stride
+            + second_dim * value_cache_dim_stride
+            + block_offset
+        )
+    else:
+        key_first_idx = (
+            block_idx * key_cache_block_stride
+            + block_offset * key_cache_page_stride
+            + first_dim
+        )
+        key_second_idx = (
+            block_idx * key_cache_block_stride
+            + block_offset * key_cache_page_stride
+            + second_dim
+        )
+        value_first_idx = (
+            block_idx * value_cache_block_stride
+            + block_offset * value_cache_page_stride
+            + first_dim
+        )
+        value_second_idx = (
+            block_idx * value_cache_block_stride
+            + block_offset * value_cache_page_stride
+            + second_dim
+        )
+
+    tl.store(key_cache_ptr + key_first_idx, out_first, mask=valid_slot & is_k)
+    tl.store(key_cache_ptr + key_second_idx, out_second, mask=valid_slot & is_k)
+    tl.store(value_cache_ptr + value_first_idx, out_first, mask=valid_slot & is_v)
+    tl.store(value_cache_ptr + value_second_idx, out_second, mask=valid_slot & is_v)
+
+
+@triton.jit
+def _fused_qkv_norm_rope_vnorm_kvcache_gptj_kernel(
+    qkv_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    v_weight_ptr,
+    cos_sin_cache_ptr,
+    position_ids_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    stride_qkv_row,
+    stride_cache_row,
+    key_cache_block_stride,
+    key_cache_page_stride,
+    key_cache_dim_stride,
+    value_cache_block_stride,
+    value_cache_page_stride,
+    value_cache_dim_stride,
+    q_size,
+    k_offset,
+    head_dim,
+    eps,
+    block_size,
+    cache_x,
+    USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    slot_idx = tl.program_id(axis=1)
+
+    row_ptr = qkv_ptr + token_idx * stride_qkv_row
+    is_q = slot_idx < 8
+    is_k = slot_idx == 8
+    is_v = slot_idx == 9
+    head_offset = tl.where(is_q, slot_idx * head_dim, tl.where(is_k, q_size, k_offset))
+    base_ptr = row_ptr + head_offset
+
+    pair_offsets = tl.arange(0, HALF_BLOCK)
+    even_ptrs = base_ptr + pair_offsets * 2
+    odd_ptrs = even_ptrs + 1
+
+    even = tl.load(even_ptrs).to(tl.float32)
+    odd = tl.load(odd_ptrs).to(tl.float32)
+    sum_sq = tl.sum(even * even + odd * odd, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sum_sq / head_dim + eps)
+
+    even_cols = pair_offsets * 2
+    odd_cols = even_cols + 1
+    q_weight_even = tl.load(q_weight_ptr + even_cols).to(tl.float32)
+    q_weight_odd = tl.load(q_weight_ptr + odd_cols).to(tl.float32)
+    k_weight_even = tl.load(k_weight_ptr + even_cols).to(tl.float32)
+    k_weight_odd = tl.load(k_weight_ptr + odd_cols).to(tl.float32)
+    v_weight_even = tl.load(v_weight_ptr + even_cols).to(tl.float32)
+    v_weight_odd = tl.load(v_weight_ptr + odd_cols).to(tl.float32)
+
+    weight_even = tl.where(
+        is_q,
+        q_weight_even,
+        tl.where(is_k, k_weight_even, v_weight_even),
+    )
+    weight_odd = tl.where(
+        is_q,
+        q_weight_odd,
+        tl.where(is_k, k_weight_odd, v_weight_odd),
+    )
+
+    norm_even = even * inv_rms * weight_even
+    norm_odd = odd * inv_rms * weight_odd
+
+    pos_idx = tl.load(position_ids_ptr + token_idx)
+    cache_ptr = cos_sin_cache_ptr + pos_idx * stride_cache_row
+    cos = tl.load(cache_ptr + pair_offsets).to(tl.float32)
+    sin = tl.load(cache_ptr + HALF_BLOCK + pair_offsets).to(tl.float32)
+
+    rope_even = norm_even * cos - norm_odd * sin
+    rope_odd = norm_odd * cos + norm_even * sin
+    qk_mask = slot_idx < 9
+    out_even = tl.where(qk_mask, rope_even, norm_even)
+    out_odd = tl.where(qk_mask, rope_odd, norm_odd)
+
+    tl.store(even_ptrs, out_even)
+    tl.store(odd_ptrs, out_odd)
+
+    slot = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+    valid_slot = slot >= 0
+    block_idx = slot // block_size
+    block_offset = slot % block_size
+
+    even_dim = even_cols
+    odd_dim = odd_cols
+
+    if USE_HEAD_MAJOR_LAYOUT:
+        key_even_idx = (
+            block_idx * key_cache_block_stride
+            + (even_dim // cache_x) * key_cache_dim_stride
+            + block_offset * cache_x
+            + (even_dim % cache_x)
+        )
+        key_odd_idx = (
+            block_idx * key_cache_block_stride
+            + (odd_dim // cache_x) * key_cache_dim_stride
+            + block_offset * cache_x
+            + (odd_dim % cache_x)
+        )
+        value_even_idx = (
+            block_idx * value_cache_block_stride
+            + even_dim * value_cache_dim_stride
+            + block_offset
+        )
+        value_odd_idx = (
+            block_idx * value_cache_block_stride
+            + odd_dim * value_cache_dim_stride
+            + block_offset
+        )
+    else:
+        key_even_idx = (
+            block_idx * key_cache_block_stride
+            + block_offset * key_cache_page_stride
+            + even_dim
+        )
+        key_odd_idx = (
+            block_idx * key_cache_block_stride
+            + block_offset * key_cache_page_stride
+            + odd_dim
+        )
+        value_even_idx = (
+            block_idx * value_cache_block_stride
+            + block_offset * value_cache_page_stride
+            + even_dim
+        )
+        value_odd_idx = (
+            block_idx * value_cache_block_stride
+            + block_offset * value_cache_page_stride
+            + odd_dim
+        )
+
+    tl.store(key_cache_ptr + key_even_idx, out_even, mask=valid_slot & is_k)
+    tl.store(key_cache_ptr + key_odd_idx, out_odd, mask=valid_slot & is_k)
+    tl.store(value_cache_ptr + value_even_idx, out_even, mask=valid_slot & is_v)
+    tl.store(value_cache_ptr + value_odd_idx, out_odd, mask=valid_slot & is_v)
+
+
+def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    layer_name: LayerNameType,
+    forced_token_heads_per_warp: int = -1,
+) -> torch.Tensor:
+    del forced_token_heads_per_warp
+    (
+        _resolved_layer_name,
+        _attn_layer,
+        kv_cache,
+        layer_slot_mapping,
+    ) = _validate_full_post_gemm_fusion_support(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos_sin_cache,
+        position_ids,
+        layer_name,
+    )
+
+    num_tokens = qkv.size(0)
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+    q_size = num_heads_q * head_dim
+    k_offset = q_size + num_heads_k * head_dim
+    grid = (num_tokens, total_heads)
+    num_warps = 4 if head_dim == 256 else 8
+    no_kv_update = layer_slot_mapping is None
+
+    if no_kv_update:
+        # Startup/profile runs may hit this op before a real KV cache and slot
+        # mapping have been installed. Mirror unified_kv_cache_update semantics:
+        # still mutate qkv in place, but suppress cache writes.
+        key_cache = torch.empty(
+            (1, 1, 1, head_dim),
+            device=qkv.device,
+            dtype=qkv.dtype,
+        )
+        value_cache = torch.empty(
+            (1, 1, 1, head_dim),
+            device=qkv.device,
+            dtype=qkv.dtype,
+        )
+        use_head_major_layout = False
+        block_size = 1
+        cache_x = 1
+        key_cache_page_stride = key_cache.stride(1)
+        key_cache_dim_stride = 0
+        value_cache_page_stride = value_cache.stride(1)
+        value_cache_dim_stride = 0
+        layer_slot_mapping = torch.full(
+            (num_tokens,),
+            -1,
+            dtype=torch.long,
+            device=qkv.device,
+        )
+    else:
+        key_cache, value_cache = kv_cache.unbind(1)
+        use_head_major_layout = key_cache.ndim == 5
+        if use_head_major_layout:
+            block_size = key_cache.shape[3]
+            cache_x = key_cache.shape[4]
+            key_cache_page_stride = 0
+            key_cache_dim_stride = key_cache.stride(2)
+            value_cache_page_stride = 0
+            value_cache_dim_stride = value_cache.stride(2)
+        else:
+            block_size = key_cache.shape[1]
+            cache_x = 1
+            key_cache_page_stride = key_cache.stride(1)
+            key_cache_dim_stride = 0
+            value_cache_page_stride = value_cache.stride(1)
+            value_cache_dim_stride = 0
+
+    if is_neox:
+        _fused_qkv_norm_rope_vnorm_kvcache_neox_kernel[grid](
+            qkv,
+            q_weight,
+            k_weight,
+            v_weight,
+            cos_sin_cache,
+            position_ids,
+            key_cache,
+            value_cache,
+            layer_slot_mapping,
+            qkv.stride(0),
+            cos_sin_cache.stride(0),
+            key_cache.stride(0),
+            key_cache_page_stride,
+            key_cache_dim_stride,
+            value_cache.stride(0),
+            value_cache_page_stride,
+            value_cache_dim_stride,
+            q_size,
+            k_offset,
+            head_dim,
+            eps,
+            block_size,
+            cache_x,
+            USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
+            HALF_BLOCK=head_dim // 2,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+    else:
+        _fused_qkv_norm_rope_vnorm_kvcache_gptj_kernel[grid](
+            qkv,
+            q_weight,
+            k_weight,
+            v_weight,
+            cos_sin_cache,
+            position_ids,
+            key_cache,
+            value_cache,
+            layer_slot_mapping,
+            qkv.stride(0),
+            cos_sin_cache.stride(0),
+            key_cache.stride(0),
+            key_cache_page_stride,
+            key_cache_dim_stride,
+            value_cache.stride(0),
+            value_cache_page_stride,
+            value_cache_dim_stride,
+            q_size,
+            k_offset,
+            head_dim,
+            eps,
+            block_size,
+            cache_x,
+            USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
+            HALF_BLOCK=head_dim // 2,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+
+    if no_kv_update:
+        return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+    return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+
+
+def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_fake(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    layer_name: LayerNameType,
+    forced_token_heads_per_warp: int = -1,
+) -> torch.Tensor:
+    del (
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        v_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+        layer_name,
+        forced_token_heads_per_warp,
+    )
+    return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
+
+
+direct_register_custom_op(
+    op_name="fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update",
+    op_func=_fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl,
+    mutates_args=["qkv"],
+    fake_impl=_fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_fake,
+)

@@ -12,6 +12,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import make_tensor_with_pad
+from vllm.v1.outputs import AsyncSampledTokenIds
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -25,6 +26,14 @@ MAX_PROMPT_SIZE = 100
 DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:{i}" for i in range(min(current_platform.device_count(), 2))]
 MAX_NUM_PROMPT_TOKENS = 64
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.sync_calls = 0
+
+    def synchronize(self):
+        self.sync_calls += 1
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
@@ -483,3 +492,31 @@ def test_pooling_metadata_token_id_buffers(
         assert metadata.get_prompt_token_ids_cpu()[0].tolist() == req.prompt_token_ids
     else:
         assert metadata.prompt_token_ids_cpu is None
+
+
+def test_update_async_output_token_ids_uses_shared_async_sampled_token_ids():
+    input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=16,
+        max_num_batched_tokens=16,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+    )
+    input_batch._req_ids = ["req0", "req1"]
+    input_batch.prev_req_id_to_index = {"req0": 0, "req1": 1}
+    input_batch.sampling_metadata.output_token_ids = [[10, -1], [20, -1]]
+
+    event = _FakeEvent()
+    async_sampled_token_ids = AsyncSampledTokenIds(
+        torch.tensor([[101, -1], [202, -1]], dtype=torch.int32),
+        event,
+    )
+    input_batch.set_async_sampled_token_ids(async_sampled_token_ids)
+
+    input_batch.update_async_output_token_ids()
+
+    assert event.sync_calls == 1
+    assert input_batch.sampling_metadata.output_token_ids == [[10, 101], [20, 202]]

@@ -36,6 +36,7 @@ from vllm.config import (
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
+    CompilationMode,
     ConfigType,
     DeviceConfig,
     ECTransferConfig,
@@ -651,6 +652,16 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
+    gemma4_kernel_experiment: Literal[
+        "baseline",
+        "decoder-residual-fusion",
+        "ple-gelu-and-mul-fusion",
+        "async-output-sync-reduction",
+        "qk-norm-rope-fusion-lt-512",
+        "qk-norm-rope-fusion-512",
+        "qkv-norm-rope-vnorm-fusion",
+        "qkv-norm-rope-vnorm-kvcache-fusion",
+    ] = "baseline"
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1380,6 +1391,44 @@ class EngineArgs:
         )
         vllm_group.add_argument("--performance-mode", **vllm_kwargs["performance_mode"])
         vllm_group.add_argument(
+            "--gemma4-kernel-experiment",
+            type=str,
+            choices=[
+                "baseline",
+                "decoder-residual-fusion",
+                "ple-gelu-and-mul-fusion",
+                "async-output-sync-reduction",
+                "qk-norm-rope-fusion-lt-512",
+                "qk-norm-rope-fusion-512",
+                "qkv-norm-rope-vnorm-fusion",
+                "qkv-norm-rope-vnorm-kvcache-fusion",
+            ],
+            default=EngineArgs.gemma4_kernel_experiment,
+            help=(
+                "Select the Gemma 4 kernel experiment mode. "
+                "'baseline' keeps the existing decoder behavior, while "
+                "'decoder-residual-fusion' enables the gated decoder "
+                "residual fusion experiment. "
+                "'ple-gelu-and-mul-fusion' enables the gated Gemma 4 PLE "
+                "GELU x multiply activation fusion experiment. "
+                "'async-output-sync-reduction' enables the gated async "
+                "scheduling output handoff experiment to reduce duplicate "
+                "sampled-token copy synchronization. "
+                "'qk-norm-rope-fusion-lt-512' enables the fused Q/K RMSNorm + "
+                "RoPE compilation experiment only for Gemma 4 attention "
+                "signatures with supported head dimensions below 512. "
+                "'qk-norm-rope-fusion-512' extends that experiment to "
+                "Gemma 4 CUDA attention signatures with head_dim=512. "
+                "'qkv-norm-rope-vnorm-fusion' enables the Gemma 4 CUDA "
+                "attention-prep compilation experiment that fuses Q/K "
+                "RMSNorm + RoPE together with weightless V RMSNorm on "
+                "non-KV-shared layers. "
+                "'qkv-norm-rope-vnorm-kvcache-fusion' extends that "
+                "experiment to also write K/V directly into the unified KV "
+                "cache, targeting the full post-GEMM pre-attention window."
+            ),
+        )
+        vllm_group.add_argument(
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
         )
 
@@ -2074,6 +2123,57 @@ class EngineArgs:
                 self.max_cudagraph_capture_size
             )
 
+        if self.gemma4_kernel_experiment in (
+            "qk-norm-rope-fusion-lt-512",
+            "qk-norm-rope-fusion-512",
+            "qkv-norm-rope-vnorm-fusion",
+            "qkv-norm-rope-vnorm-kvcache-fusion",
+        ):
+            experiment_name = f"gemma4_kernel_experiment='{self.gemma4_kernel_experiment}'"
+            if (
+                self.gemma4_kernel_experiment
+                in (
+                    "qk-norm-rope-fusion-512",
+                    "qkv-norm-rope-vnorm-fusion",
+                    "qkv-norm-rope-vnorm-kvcache-fusion",
+                )
+                and not current_platform.is_cuda()
+            ):
+                raise ValueError(
+                    f"{experiment_name} is currently supported only on CUDA."
+                )
+            if compilation_config.mode not in (
+                None,
+                CompilationMode.VLLM_COMPILE,
+            ):
+                raise ValueError(
+                    f"{experiment_name} requires "
+                    "CompilationMode.VLLM_COMPILE (or the default auto-selected "
+                    "compile mode)."
+                )
+            if "-rms_norm" in compilation_config.custom_ops:
+                raise ValueError(
+                    f"{experiment_name} is incompatible with custom_ops "
+                    "disabling rms_norm."
+                )
+            if "-rotary_embedding" in compilation_config.custom_ops:
+                raise ValueError(
+                    f"{experiment_name} is incompatible with custom_ops "
+                    "disabling rotary_embedding."
+                )
+
+            compilation_config.pass_config.enable_qk_norm_rope_fusion = True
+            if "+rms_norm" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("+rms_norm")
+            if "+rotary_embedding" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("+rotary_embedding")
+            if self.gemma4_kernel_experiment == "qkv-norm-rope-vnorm-kvcache-fusion":
+                compilation_config.splitting_ops = [
+                    op
+                    for op in compilation_config.splitting_ops
+                    if op != "vllm::unified_kv_cache_update"
+                ]
+
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
             uva=UVAOffloadConfig(
@@ -2090,6 +2190,9 @@ class EngineArgs:
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+        self.additional_config["gemma4_kernel_experiment"] = (
+            self.gemma4_kernel_experiment
+        )
 
         config = VllmConfig(
             model_config=model_config,

@@ -3,6 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import threading
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
 import numpy as np
@@ -213,6 +214,46 @@ class AsyncModelRunnerOutput(ABC):
         This method should only be called once per AsyncModelRunnerOutput.
         """
         pass
+
+
+class AsyncSampledTokenIds:
+    """Shared async sampled-token handoff for async scheduling.
+
+    This wraps the CPU-side sampled-token tensor and its copy-ready event so
+    multiple consumers can reuse the same synchronization and tolist()
+    materialization without repeating either operation.
+    """
+
+    def __init__(
+        self,
+        sampled_token_ids_cpu: torch.Tensor,
+        copy_ready_event: torch.Event,
+    ) -> None:
+        self._sampled_token_ids_cpu = sampled_token_ids_cpu
+        self._copy_ready_event = copy_ready_event
+        self._ready = False
+        self._token_id_lists: list[list[int]] | None = None
+        self._lock = threading.Lock()
+
+    def wait_until_ready(self) -> None:
+        with self._lock:
+            if self._ready:
+                return
+            self._copy_ready_event.synchronize()
+            self._ready = True
+
+    def get_cpu_tensor(self) -> torch.Tensor:
+        self.wait_until_ready()
+        return self._sampled_token_ids_cpu
+
+    def get_token_id_lists(self) -> list[list[int]]:
+        with self._lock:
+            if self._token_id_lists is None:
+                if not self._ready:
+                    self._copy_ready_event.synchronize()
+                    self._ready = True
+                self._token_id_lists = self._sampled_token_ids_cpu.tolist()
+            return [token_ids.copy() for token_ids in self._token_id_lists]
 
 
 @dataclass

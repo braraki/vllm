@@ -305,6 +305,50 @@ class GeluAndMul(CustomOp):
         return f"approximate={repr(self.approximate)}"
 
 
+@CustomOp.register("ple_gelu_and_mul")
+class PLEGeluAndMul(CustomOp):
+    """Gemma4 PLE activation: GELU_tanh(gate) * value.
+
+    Shapes:
+        gate: (num_tokens, d) or (batch_size, seq_len, d)
+        value: same shape as gate
+        return: same shape as gate
+    """
+
+    def __init__(self):
+        super().__init__()
+        if current_platform.is_cuda_alike():
+            op = getattr(torch.ops._C, "ple_gelu_tanh_and_mul", None)
+            if op is not None:
+                self.op = op
+        if current_platform.is_rocm():
+            logger.warning_once(
+                "[ROCm] PyTorch's native GELU with tanh approximation is unstable "
+                "with torch.compile. PLEGeluAndMul forward_native falls back to "
+                "'none' approximation when custom op dispatch is unavailable."
+            )
+
+    def forward_native(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        approximate = "tanh"
+        if current_platform.is_rocm():
+            approximate = "none"
+        return F.gelu(gate, approximate=approximate) * value
+
+    def forward_cuda(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "op"):
+            raise RuntimeError(
+                "PLEGeluAndMul requires torch.ops._C.ple_gelu_tanh_and_mul, "
+                "but the custom op is not registered. Rebuild vLLM so the "
+                "new CUDA extension is available."
+            )
+        out = torch.empty_like(gate)
+        self.op(out, gate, value)
+        return out
+
+    def forward_xpu(self, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(gate, value)
+
+
 # --8<-- [start:swigluoai_and_mul]
 @CustomOp.register("swigluoai_and_mul")
 class SwigluOAIAndMul(CustomOp):

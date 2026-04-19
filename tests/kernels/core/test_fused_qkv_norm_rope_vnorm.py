@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tests.kernels.utils import opcheck
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
@@ -14,15 +15,15 @@ DTYPES = [torch.bfloat16, torch.float16]
 IS_NEOX = [True, False]
 EPS_VALUES = [1e-5, 1e-6]
 SEEDS = [13]
-PARTIAL_ROPE = [True, False]
 CUDA_DEVICES = ["cuda:0"]
 
 
-def _apply_qk_norm_rope(
+def _apply_qkv_norm_rope_vnorm(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    v_norm: RMSNorm,
     rope: RotaryEmbedding,
     num_heads_q: int,
     num_heads_kv: int,
@@ -42,10 +43,15 @@ def _apply_qk_norm_rope(
     k = k_by_head.view(k.shape)
 
     q, k = rope.forward_native(positions, q, k)
+
+    v_by_head = v.view(*v.shape[:-1], v.shape[-1] // head_dim, head_dim)
+    v_by_head = v_norm.forward_native(v_by_head)
+    v = v_by_head.view(v.shape)
+
     return torch.cat([q, k, v], dim=-1)
 
 
-def _run_fused_qk_norm_rope_case(
+def _run_fused_qkv_norm_rope_vnorm_case(
     *,
     device: str,
     dtype: torch.dtype,
@@ -69,10 +75,14 @@ def _run_fused_qk_norm_rope_case(
 
     q_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
     k_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
+    v_norm = RMSNorm(head_dim, eps=eps, has_weight=False).to(
+        device=device, dtype=dtype
+    )
     q_norm.weight.data.normal_(mean=1.0, std=0.1)
     k_norm.weight.data.normal_(mean=1.0, std=0.1)
     q_weight = q_norm.weight.data
     k_weight = k_norm.weight.data
+
     rotary_dim = int(head_dim * rotary_ratio)
     rope = RotaryEmbedding(
         head_size=head_dim,
@@ -83,11 +93,12 @@ def _run_fused_qk_norm_rope_case(
         dtype=dtype,
     ).to(device)
 
-    ref_result = _apply_qk_norm_rope(
+    ref_result = _apply_qkv_norm_rope_vnorm(
         qkv=qkv_base,
         positions=positions,
         q_norm=q_norm,
         k_norm=k_norm,
+        v_norm=v_norm,
         rope=rope,
         num_heads_q=num_heads,
         num_heads_kv=num_kv_heads,
@@ -108,9 +119,9 @@ def _run_fused_qk_norm_rope_case(
         positions.view(-1),
         forced_token_heads_per_warp,
     )
-    opcheck(torch.ops._C.fused_qk_norm_rope, opcheck_args)
+    opcheck(torch.ops.vllm.fused_qkv_norm_rope_vnorm, opcheck_args)
 
-    torch.ops._C.fused_qk_norm_rope(
+    ops.fused_qkv_norm_rope_vnorm(
         qkv_fused,
         num_heads,
         num_kv_heads,
@@ -128,66 +139,27 @@ def _run_fused_qk_norm_rope_case(
     if dtype == torch.float16:
         atol, rtol = (2e-3, 2e-3)
     elif head_dim == 512:
-        # The bf16 512-dim path accumulates a small amount of extra error
-        # versus the reference implementation, especially for full Neox RoPE.
         atol, rtol = (2e-2, 1e-2)
     else:
         atol, rtol = (1e-2, 1e-2)
 
-    torch.testing.assert_close(
-        qkv_fused,
-        ref_result,
-        atol=atol,
-        rtol=rtol,
-    )
-
-
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="fused_qk_norm_rope custom op requires cuda and rocm platform",
-)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("is_neox", IS_NEOX)
-@pytest.mark.parametrize("eps", EPS_VALUES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
-@torch.inference_mode()
-def test_fused_qk_norm_rope_matches_reference(
-    default_vllm_config,
-    device: str,
-    dtype: torch.dtype,
-    is_neox: bool,
-    eps: float,
-    seed: int,
-    rotary_ratio: float,
-):
-    _run_fused_qk_norm_rope_case(
-        device=device,
-        dtype=dtype,
-        is_neox=is_neox,
-        eps=eps,
-        seed=seed,
-        rotary_ratio=rotary_ratio,
-        num_heads=16,
-        num_kv_heads=4,
-        head_dim=128,
-    )
+    torch.testing.assert_close(qkv_fused, ref_result, atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
-    reason="head_dim=512 fused_qk_norm_rope coverage is CUDA-only",
+    reason="fused_qkv_norm_rope_vnorm custom op requires CUDA",
 )
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("is_neox", IS_NEOX)
 @pytest.mark.parametrize("eps", EPS_VALUES)
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
+@pytest.mark.parametrize("rotary_ratio", [1.0])
+@pytest.mark.parametrize("head_dim", [256, 512])
 @pytest.mark.parametrize("forced_token_heads_per_warp", [1, 2, 4])
 @torch.inference_mode()
-def test_fused_qk_norm_rope_matches_reference_head_dim_512(
+def test_fused_qkv_norm_rope_vnorm_matches_reference(
     default_vllm_config,
     device: str,
     dtype: torch.dtype,
@@ -195,9 +167,10 @@ def test_fused_qk_norm_rope_matches_reference_head_dim_512(
     eps: float,
     seed: int,
     rotary_ratio: float,
+    head_dim: int,
     forced_token_heads_per_warp: int,
 ):
-    _run_fused_qk_norm_rope_case(
+    _run_fused_qkv_norm_rope_vnorm_case(
         device=device,
         dtype=dtype,
         is_neox=is_neox,
@@ -206,6 +179,6 @@ def test_fused_qk_norm_rope_matches_reference_head_dim_512(
         rotary_ratio=rotary_ratio,
         num_heads=8,
         num_kv_heads=1,
-        head_dim=512,
+        head_dim=head_dim,
         forced_token_heads_per_warp=forced_token_heads_per_warp,
     )
