@@ -36,6 +36,7 @@ from vllm.config import (
     AttentionConfig,
     CacheConfig,
     CompilationConfig,
+    CompilationMode,
     ConfigType,
     DeviceConfig,
     ECTransferConfig,
@@ -651,6 +652,7 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton"] | None = None
+    gemma4_pre_attention_kernel: bool = False
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1419,6 +1421,16 @@ class EngineArgs:
             default=None,
             help="Select GDN prefill backend.",
         )
+        parser.add_argument(
+            "--gemma4-pre-attention-kernel",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.gemma4_pre_attention_kernel,
+            help=(
+                "Enable the opt-in Gemma4 pre-attention kernel that fuses "
+                "Q/K RMSNorm, RoPE, V RMSNorm, and unified KV-cache update "
+                "for supported TritonAttention decode layers."
+            ),
+        )
         return parser
 
     @classmethod
@@ -2073,6 +2085,38 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
+
+        if self.gemma4_pre_attention_kernel:
+            feature_name = "gemma4_pre_attention_kernel=True"
+            if not current_platform.is_cuda():
+                raise ValueError(f"{feature_name} is currently supported only on CUDA.")
+            if compilation_config.mode not in (None, CompilationMode.VLLM_COMPILE):
+                raise ValueError(
+                    f"{feature_name} requires CompilationMode.VLLM_COMPILE "
+                    "(or the default auto-selected compile mode)."
+                )
+            if "-rms_norm" in compilation_config.custom_ops:
+                raise ValueError(
+                    f"{feature_name} is incompatible with custom_ops "
+                    "disabling rms_norm."
+                )
+            if "-rotary_embedding" in compilation_config.custom_ops:
+                raise ValueError(
+                    f"{feature_name} is incompatible with custom_ops "
+                    "disabling rotary_embedding."
+                )
+
+            compilation_config.pass_config.enable_qk_norm_rope_fusion = True
+            if "+rms_norm" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("+rms_norm")
+            if "+rotary_embedding" not in compilation_config.custom_ops:
+                compilation_config.custom_ops.append("+rotary_embedding")
+            compilation_config.splitting_ops = [
+                op
+                for op in compilation_config.splitting_ops
+                if op != "vllm::unified_kv_cache_update"
+            ]
+            self.additional_config["gemma4_pre_attention_kernel"] = True
 
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
