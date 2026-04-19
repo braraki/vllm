@@ -414,7 +414,7 @@ def test_qk_norm_rope_fusion_mixed_attention_signatures(
     reason="QKV Norm+RoPE+VNorm fusion coverage is CUDA-only",
 )
 def test_qkv_norm_rope_vnorm_fusion(dtype):
-    if not hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm"):
+    if FUSED_QKV_ROPE_VNORM_OP is None:
         pytest.skip("fused_qkv_norm_rope_vnorm custom op not available")
 
     torch.set_default_device("cuda")
@@ -492,7 +492,7 @@ def test_qkv_norm_rope_vnorm_fusion(dtype):
     reason="QKV Norm+RoPE+VNorm fusion coverage is CUDA-only",
 )
 def test_qkv_norm_rope_vnorm_does_not_match_without_v_norm(dtype):
-    if not hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm"):
+    if FUSED_QKV_ROPE_VNORM_OP is None:
         pytest.skip("fused_qkv_norm_rope_vnorm custom op not available")
 
     torch.set_default_device("cuda")

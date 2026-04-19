@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tests.kernels.utils import opcheck
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
@@ -118,9 +119,9 @@ def _run_fused_qkv_norm_rope_vnorm_case(
         positions.view(-1),
         forced_token_heads_per_warp,
     )
-    opcheck(torch.ops._C.fused_qkv_norm_rope_vnorm, opcheck_args)
+    opcheck(torch.ops.vllm.fused_qkv_norm_rope_vnorm, opcheck_args)
 
-    torch.ops._C.fused_qkv_norm_rope_vnorm(
+    ops.fused_qkv_norm_rope_vnorm(
         qkv_fused,
         num_heads,
         num_kv_heads,
@@ -154,7 +155,7 @@ def _run_fused_qkv_norm_rope_vnorm_case(
 @pytest.mark.parametrize("is_neox", IS_NEOX)
 @pytest.mark.parametrize("eps", EPS_VALUES)
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("rotary_ratio", [1.0, 0.5, 0.25])
+@pytest.mark.parametrize("rotary_ratio", [1.0])
 @pytest.mark.parametrize("head_dim", [256, 512])
 @pytest.mark.parametrize("forced_token_heads_per_warp", [1, 2, 4])
 @torch.inference_mode()

@@ -7,6 +7,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.kernels import qkv_norm_rope_vnorm_triton as _qkv_norm_rope_vnorm_triton  # noqa: F401
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
 from vllm.utils.flashinfer import (
@@ -467,7 +468,7 @@ def fused_qkv_norm_rope_vnorm(
     position_ids: torch.Tensor,
     forced_token_heads_per_warp: int = -1,
 ) -> None:
-    torch.ops._C.fused_qkv_norm_rope_vnorm(
+    torch.ops.vllm.fused_qkv_norm_rope_vnorm(
         qkv,
         num_heads_q,
         num_heads_k,

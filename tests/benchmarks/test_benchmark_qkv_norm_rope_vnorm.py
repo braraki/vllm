@@ -45,7 +45,9 @@ def test_write_csv_smoke(tmp_path: Path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA benchmark smoke only")
 def test_benchmark_provider_attention_prep_custom_op_smoke():
-    if not hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm"):
+    if not hasattr(torch.ops, "vllm") or not hasattr(
+        torch.ops.vllm, "fused_qkv_norm_rope_vnorm"
+    ):
         pytest.skip("fused_qkv_norm_rope_vnorm custom op not available")
 
     median_ms, min_ms, max_ms = benchmark_provider(
@@ -64,7 +66,9 @@ def test_benchmark_provider_attention_prep_custom_op_smoke():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA correctness only")
 def test_validate_outputs_smoke():
-    if not hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm"):
+    if not hasattr(torch.ops, "vllm") or not hasattr(
+        torch.ops.vllm, "fused_qkv_norm_rope_vnorm"
+    ):
         pytest.skip("fused_qkv_norm_rope_vnorm custom op not available")
 
     validate_outputs(

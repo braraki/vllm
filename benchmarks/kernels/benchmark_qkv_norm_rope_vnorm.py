@@ -45,11 +45,9 @@ DEFAULT_PROVIDERS = [
     "attention_prep_custom_op",
 ]
 
-REBUILD_VLLM_MESSAGE = (
-    "fused_qkv_norm_rope_vnorm custom op is not available. "
-    "Rebuild the editable vLLM install first with: "
-    "`cd ~/vllm && source .venv/bin/activate && "
-    "uv pip install -e . --torch-backend=auto`"
+FUSED_OP_MESSAGE = (
+    "fused_qkv_norm_rope_vnorm Triton custom op is not available. "
+    "Ensure vLLM imports succeeded and Triton is available on CUDA."
 )
 
 
@@ -324,8 +322,10 @@ def validate_outputs(
     if not torch.cuda.is_available():
         raise RuntimeError("validate_outputs requires CUDA")
 
-    if not hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm"):
-        raise RuntimeError(REBUILD_VLLM_MESSAGE)
+    if not hasattr(torch.ops, "vllm") or not hasattr(
+        torch.ops.vllm, "fused_qkv_norm_rope_vnorm"
+    ):
+        raise RuntimeError(FUSED_OP_MESSAGE)
 
     set_random_seed(7)
     total_dim = (num_heads + 2 * num_kv_heads) * head_dim

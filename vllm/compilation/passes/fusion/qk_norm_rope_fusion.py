@@ -13,6 +13,7 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 import vllm.ir.ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels import qkv_norm_rope_vnorm_triton as _qkv_norm_rope_vnorm_triton  # noqa: F401
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
@@ -26,8 +27,9 @@ logger = init_logger(__name__)
 
 FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
 FUSED_QKV_ROPE_VNORM_OP = (
-    torch.ops._C.fused_qkv_norm_rope_vnorm.default
-    if hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm")
+    torch.ops.vllm.fused_qkv_norm_rope_vnorm.default
+    if hasattr(torch.ops, "vllm")
+    and hasattr(torch.ops.vllm, "fused_qkv_norm_rope_vnorm")
     else None
 )
 RMS_NORM_OP = torch.ops.vllm_ir.rms_norm.default
@@ -307,8 +309,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
                             logger.warning(
                                 "Skipping qkv-norm-rope-vnorm-fusion pattern "
                                 "registration because fused_qkv_norm_rope_vnorm "
-                                "is not available in torch.ops._C. Rebuild the "
-                                "vLLM extension before running this mode."
+                                "is not available in torch.ops.vllm."
                             )
                             continue
                         QKVNormRopeVNormPattern(

@@ -156,8 +156,9 @@ class FixFunctionalizationPass(VllmInductorPass):
             # Defunctionalize fused_qk_norm_rope and
             # fused_qkv_norm_rope_vnorm to remove higher-order wrappers.
             elif at_target == torch.ops._C.fused_qk_norm_rope.default or (
-                hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm")
-                and at_target == torch.ops._C.fused_qkv_norm_rope_vnorm.default
+                hasattr(torch.ops, "vllm")
+                and hasattr(torch.ops.vllm, "fused_qkv_norm_rope_vnorm")
+                and at_target == torch.ops.vllm.fused_qkv_norm_rope_vnorm.default
             ):
                 mutated_args = {1: "qkv"}
                 args = (
