@@ -12,10 +12,6 @@ Baseline:
     q, k = rotary_emb(positions, q, k)
     v = v_norm(v)
 
-Control fusion:
-    fused_qk_norm_rope(qkv, ...)
-    v = v_norm(v)
-
 New kernel:
     fused_qkv_norm_rope_vnorm(qkv, ...)
 """
@@ -38,12 +34,13 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, set_random_seed
 DEFAULT_MODEL = "google/gemma-4-E2B-it"
 DEFAULT_NUM_TOKENS = [1, 4, 16, 64, 256, 1024]
 DEFAULT_PROVIDERS = [
-    "baseline_eager",
     "baseline_compiled",
-    "qk_fusion_compiled",
-    "qk_fusion_custom_op",
     "attention_prep_custom_op",
 ]
+
+# Provider glossary:
+# - baseline_compiled: the same unfused block under torch.compile.
+# - attention_prep_custom_op: new Part 3 fused Q/K/V attention-prep custom op.
 
 FUSED_OP_MESSAGE = (
     "fused_qkv_norm_rope_vnorm Triton custom op is not available. "
@@ -175,48 +172,6 @@ def baseline_attention_prep(
     return q, k, v
 
 
-def qk_fusion_attention_prep(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    eps: float,
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    is_neox: bool,
-    forced_token_heads_per_warp: int = -1,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    qkv = qkv.clone()
-    ops.fused_qk_norm_rope(
-        qkv,
-        num_heads,
-        num_kv_heads,
-        num_kv_heads,
-        head_dim,
-        eps,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        is_neox,
-        positions.view(-1),
-        forced_token_heads_per_warp,
-    )
-    q_size = num_heads * head_dim
-    kv_size = num_kv_heads * head_dim
-    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-    v_by_head = v.view(v.shape[0], num_kv_heads, head_dim)
-    v = RMSNorm.forward_static(
-        v_by_head,
-        eps,
-        head_dim,
-        v.dtype,
-        None,
-    ).view(v.shape)
-    return q, k, v
-
-
 def attention_prep_custom_op(
     qkv: torch.Tensor,
     positions: torch.Tensor,
@@ -287,16 +242,9 @@ def benchmark_provider(
         is_neox,
     )
 
-    if provider == "baseline_eager":
-        fn = lambda: baseline_attention_prep(*args)
-    elif provider == "baseline_compiled":
+    if provider == "baseline_compiled":
         compiled_fn = torch.compile(baseline_attention_prep)
         fn = lambda: compiled_fn(*args)
-    elif provider == "qk_fusion_compiled":
-        compiled_fn = torch.compile(qk_fusion_attention_prep)
-        fn = lambda: compiled_fn(*args)
-    elif provider == "qk_fusion_custom_op":
-        fn = lambda: qk_fusion_attention_prep(*args)
     elif provider == "attention_prep_compiled":
         compiled_fn = torch.compile(attention_prep_custom_op)
         fn = lambda: compiled_fn(*args)
@@ -394,29 +342,51 @@ def write_plots(rows: list[dict[str, float | int | str]], output_dir: Path) -> N
 
     output_dir.mkdir(parents=True, exist_ok=True)
     head_dims = sorted({int(row["head_dim"]) for row in rows})
-    providers = sorted({str(row["provider"]) for row in rows})
+    provider_order = [
+        "baseline_compiled",
+        "attention_prep_custom_op",
+        "attention_prep_compiled",
+    ]
 
     for head_dim in head_dims:
-        plt.figure(figsize=(9, 5))
+        plt.figure(figsize=(10, 5))
         dim_rows = [row for row in rows if int(row["head_dim"]) == head_dim]
-        for provider in providers:
-            provider_rows = sorted(
-                (row for row in dim_rows if row["provider"] == provider),
-                key=lambda row: int(row["num_tokens"]),
-            )
-            if not provider_rows:
-                continue
-            plt.plot(
-                [int(row["num_tokens"]) for row in provider_rows],
-                [float(row["median_ms"]) for row in provider_rows],
-                marker="o",
+        token_counts = sorted({int(row["num_tokens"]) for row in dim_rows})
+        providers = [
+            provider
+            for provider in provider_order
+            if any(row["provider"] == provider for row in dim_rows)
+        ]
+        if not providers:
+            plt.close()
+            continue
+
+        grouped_rows = {
+            (str(row["provider"]), int(row["num_tokens"])): float(row["median_ms"])
+            for row in dim_rows
+        }
+        group_positions = list(range(len(token_counts)))
+        bar_width = 0.8 / len(providers)
+
+        for provider_idx, provider in enumerate(providers):
+            x_positions = [
+                group_pos - 0.4 + (provider_idx + 0.5) * bar_width
+                for group_pos in group_positions
+            ]
+            latencies = [
+                grouped_rows[(provider, token_count)] for token_count in token_counts
+            ]
+            plt.bar(
+                x_positions,
+                latencies,
+                width=bar_width,
                 label=provider,
             )
         plt.title(f"Attention Prep Fusion Benchmark (head_dim={head_dim})")
         plt.xlabel("num_tokens")
         plt.ylabel("median latency (ms)")
-        plt.xscale("log")
-        plt.grid(True, which="both", linestyle="--", alpha=0.4)
+        plt.xticks(group_positions, [str(token_count) for token_count in token_counts])
+        plt.grid(True, axis="y", linestyle="--", alpha=0.4)
         plt.legend()
         plt.tight_layout()
         plt.savefig(output_dir / f"qkv_norm_rope_vnorm_head_dim_{head_dim}.png")
