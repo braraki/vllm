@@ -388,7 +388,7 @@ def write_plots(rows: list[dict[str, float | int | str]], output_dir: Path) -> N
                 labels=[f"{latency_us:.1f}" for latency_us in latencies_us],
                 padding=3,
                 fontsize=8,
-                rotation=90,
+                rotation=0,
             )
         plt.title(f"Attention Prep Fusion Benchmark (head_dim={head_dim})")
         plt.xlabel("num_tokens")
