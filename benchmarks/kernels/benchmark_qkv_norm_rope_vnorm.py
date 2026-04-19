@@ -122,6 +122,7 @@ def baseline_attention_prep(
     positions: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
     num_heads: int,
@@ -167,7 +168,7 @@ def baseline_attention_prep(
         eps,
         head_dim,
         v.dtype,
-        None,
+        v_weight,
     ).view(v.shape)
     return q, k, v
 
@@ -177,6 +178,7 @@ def attention_prep_custom_op(
     positions: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
     num_heads: int,
@@ -195,6 +197,7 @@ def attention_prep_custom_op(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         is_neox,
         positions.view(-1),
@@ -227,6 +230,7 @@ def benchmark_provider(
     positions = torch.arange(num_tokens, dtype=torch.long, device="cuda")
     q_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
     k_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
+    v_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
     cos_sin_cache = _make_rope_cache(4096, head_dim, dtype, is_neox)
 
     args = (
@@ -234,6 +238,7 @@ def benchmark_provider(
         positions,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         eps,
         num_heads,
@@ -283,6 +288,7 @@ def validate_outputs(
     positions = torch.arange(num_tokens, dtype=torch.long, device="cuda")
     q_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
     k_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
+    v_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
     cos_sin_cache = _make_rope_cache(4096, head_dim, dtype, is_neox)
 
     baseline_q, baseline_k, baseline_v = baseline_attention_prep(
@@ -290,6 +296,7 @@ def validate_outputs(
         positions,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         eps,
         num_heads,
@@ -302,6 +309,7 @@ def validate_outputs(
         positions,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         eps,
         num_heads,

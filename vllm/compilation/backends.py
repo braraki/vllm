@@ -552,9 +552,19 @@ def _decompose_size_nodes(graph: fx.GraphModule) -> None:
 
 
 def split_graph(
-    graph: fx.GraphModule, splitting_ops: list[str]
+    graph: fx.GraphModule,
+    splitting_ops: list[str],
+    split_exempt_nodes: set[fx.Node] | None = None,
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
     _decompose_size_nodes(graph)
+    split_exempt_nodes = split_exempt_nodes or set()
+
+    def should_split_here(node: fx.Node | None) -> bool:
+        return (
+            node is not None
+            and node not in split_exempt_nodes
+            and should_split(node, splitting_ops)
+        )
 
     # split graph by ops
     subgraph_id = 0
@@ -576,14 +586,14 @@ def split_graph(
                 node_to_subgraph_id[node] = node_to_subgraph_id[input_node]
                 continue
 
-        if should_split(node, splitting_ops):
+        if should_split_here(node):
             subgraph_id += 1
             node_to_subgraph_id[node] = subgraph_id
             split_op_graphs.append(subgraph_id)
 
             # keep consecutive splitting ops together
             # (we know node.next exists because node isn't the last (output) node)
-            if should_split(node.next, splitting_ops):
+            if should_split_here(node.next):
                 # this will get incremented by the next node
                 subgraph_id -= 1
             else:
@@ -1159,8 +1169,23 @@ class VllmBackend:
             fx_split_ops: list[str] = []
         else:
             fx_split_ops = self.compilation_config.splitting_ops or []
+        split_exempt_nodes: set[fx.Node] = set()
+        if fx_split_ops:
+            for pass_ in getattr(self.pass_manager, "passes", []):
+                collect_fn = getattr(pass_, "collect_part4_split_exempt_nodes", None)
+                if callable(collect_fn):
+                    split_exempt_nodes.update(collect_fn(graph))
+            if split_exempt_nodes and envs.VLLM_PATTERN_MATCH_DEBUG is not None:
+                logger.debug(
+                    "FX split exemptions enabled for %d nodes",
+                    len(split_exempt_nodes),
+                )
 
-        self.split_gm, self.piecewise_graphs = split_graph(graph, fx_split_ops)
+        self.split_gm, self.piecewise_graphs = split_graph(
+            graph,
+            fx_split_ops,
+            split_exempt_nodes=split_exempt_nodes,
+        )
 
         # keep a split_gm copy from BEFORE the interpreter replaces
         # submodules with PiecewiseBackend -- used for serialization

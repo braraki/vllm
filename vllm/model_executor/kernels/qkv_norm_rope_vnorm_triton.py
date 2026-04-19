@@ -114,6 +114,7 @@ def _fused_qkv_norm_rope_vnorm_neox_kernel(
     qkv_ptr,
     q_weight_ptr,
     k_weight_ptr,
+    v_weight_ptr,
     cos_sin_cache_ptr,
     position_ids_ptr,
     stride_qkv_row,
@@ -150,16 +151,20 @@ def _fused_qkv_norm_rope_vnorm_neox_kernel(
     k_weight_second = tl.load(k_weight_ptr + HALF_BLOCK + half_offsets).to(
         tl.float32
     )
+    v_weight_first = tl.load(v_weight_ptr + half_offsets).to(tl.float32)
+    v_weight_second = tl.load(v_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
 
     weight_first = tl.where(
         is_q,
         q_weight_first,
-        tl.where(is_k, k_weight_first, 1.0),
+        tl.where(is_k, k_weight_first, v_weight_first),
     )
     weight_second = tl.where(
         is_q,
         q_weight_second,
-        tl.where(is_k, k_weight_second, 1.0),
+        tl.where(is_k, k_weight_second, v_weight_second),
     )
 
     norm_first = first * inv_rms * weight_first
@@ -189,6 +194,7 @@ def _fused_qkv_norm_rope_vnorm_gptj_kernel(
     qkv_ptr,
     q_weight_ptr,
     k_weight_ptr,
+    v_weight_ptr,
     cos_sin_cache_ptr,
     position_ids_ptr,
     stride_qkv_row,
@@ -223,9 +229,19 @@ def _fused_qkv_norm_rope_vnorm_gptj_kernel(
     q_weight_odd = tl.load(q_weight_ptr + odd_cols).to(tl.float32)
     k_weight_even = tl.load(k_weight_ptr + even_cols).to(tl.float32)
     k_weight_odd = tl.load(k_weight_ptr + odd_cols).to(tl.float32)
+    v_weight_even = tl.load(v_weight_ptr + even_cols).to(tl.float32)
+    v_weight_odd = tl.load(v_weight_ptr + odd_cols).to(tl.float32)
 
-    weight_even = tl.where(is_q, q_weight_even, tl.where(is_k, k_weight_even, 1.0))
-    weight_odd = tl.where(is_q, q_weight_odd, tl.where(is_k, k_weight_odd, 1.0))
+    weight_even = tl.where(
+        is_q,
+        q_weight_even,
+        tl.where(is_k, k_weight_even, v_weight_even),
+    )
+    weight_odd = tl.where(
+        is_q,
+        q_weight_odd,
+        tl.where(is_k, k_weight_odd, v_weight_odd),
+    )
 
     norm_even = even * inv_rms * weight_even
     norm_odd = odd * inv_rms * weight_odd
@@ -258,6 +274,7 @@ def _fused_qkv_norm_rope_vnorm_impl(
     eps: float,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     position_ids: torch.Tensor,
@@ -272,7 +289,7 @@ def _fused_qkv_norm_rope_vnorm_impl(
         head_dim,
         q_weight,
         k_weight,
-        None,
+        v_weight,
         cos_sin_cache,
         position_ids,
     )
@@ -289,6 +306,7 @@ def _fused_qkv_norm_rope_vnorm_impl(
             qkv,
             q_weight,
             k_weight,
+            v_weight,
             cos_sin_cache,
             position_ids,
             qkv.stride(0),
@@ -306,6 +324,7 @@ def _fused_qkv_norm_rope_vnorm_impl(
             qkv,
             q_weight,
             k_weight,
+            v_weight,
             cos_sin_cache,
             position_ids,
             qkv.stride(0),
@@ -329,6 +348,7 @@ def _fused_qkv_norm_rope_vnorm_fake(
     eps: float,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     position_ids: torch.Tensor,
@@ -343,6 +363,7 @@ def _fused_qkv_norm_rope_vnorm_fake(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         is_neox,
         position_ids,

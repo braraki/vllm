@@ -75,13 +75,13 @@ def _run_fused_qkv_norm_rope_vnorm_case(
 
     q_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
     k_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
-    v_norm = RMSNorm(head_dim, eps=eps, has_weight=False).to(
-        device=device, dtype=dtype
-    )
+    v_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
     q_norm.weight.data.normal_(mean=1.0, std=0.1)
     k_norm.weight.data.normal_(mean=1.0, std=0.1)
+    v_norm.weight.data.normal_(mean=1.0, std=0.1)
     q_weight = q_norm.weight.data
     k_weight = k_norm.weight.data
+    v_weight = v_norm.weight.data
 
     rotary_dim = int(head_dim * rotary_ratio)
     rope = RotaryEmbedding(
@@ -114,6 +114,7 @@ def _run_fused_qkv_norm_rope_vnorm_case(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         rope.cos_sin_cache,
         is_neox,
         positions.view(-1),
@@ -130,6 +131,7 @@ def _run_fused_qkv_norm_rope_vnorm_case(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         rope.cos_sin_cache,
         is_neox,
         positions.view(-1),

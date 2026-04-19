@@ -195,6 +195,25 @@ def test_consecutive_ops_in_split():
     ] + ["output"]
 
 
+def test_split_graph_respects_node_exemptions():
+    def model_fn(x: torch.Tensor) -> torch.Tensor:
+        y = torch.sigmoid(x)
+        return torch.relu(y)
+
+    x = torch.randn(4, 3)
+    gm = make_fx(model_fn)(x)
+    sigmoid_node = next(find_op_nodes(torch.ops.aten.sigmoid.default, gm.graph))
+
+    split_gm, split_items = split_graph(
+        gm,
+        ["aten::sigmoid"],
+        split_exempt_nodes={sigmoid_node},
+    )
+
+    assert len(split_items) == 1, "Exempt split node should keep graph connected"
+    torch.testing.assert_close(gm(x), split_gm(x))
+
+
 def _get_empty_nodes(split_item):
     return [
         node for node in split_item.graph.graph.nodes if _is_empty_allocation_node(node)
