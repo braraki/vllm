@@ -267,3 +267,100 @@ def test_fused_qkv_norm_rope_vnorm_kvcache_matches_reference(
     torch.testing.assert_close(baseline_k, fused_k, atol=atol, rtol=rtol)
     torch.testing.assert_close(baseline_v, fused_v, atol=atol, rtol=rtol)
     torch.testing.assert_close(baseline_cache, fused_cache, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="Part 4 fused post-GEMM op requires CUDA",
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@torch.inference_mode()
+def test_fused_qkv_norm_rope_vnorm_kvcache_skips_missing_slot_mapping(
+    dtype: torch.dtype,
+    head_dim: int,
+):
+    if not hasattr(torch.ops, "vllm") or not hasattr(
+        torch.ops.vllm, "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update"
+    ):
+        pytest.skip("Part 4 fused post-GEMM custom op not available")
+
+    set_random_seed(11)
+    num_heads = 8
+    num_kv_heads = 1
+    num_tokens = 5
+    device = torch.device("cuda")
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        cache_config=CacheConfig(block_size=16, cache_dtype="auto"),
+    )
+
+    with set_current_vllm_config(vllm_config):
+        attn = Attention(
+            num_heads=num_heads,
+            head_size=head_dim,
+            scale=1.0 / head_dim**0.5,
+            num_kv_heads=num_kv_heads,
+            cache_config=vllm_config.cache_config,
+            prefix="model.layers.0.self_attn.attn",
+            attn_backend=AttentionBackendEnum.TRITON_ATTN.get_class(),
+        )
+
+    total_dim = (num_heads + 2 * num_kv_heads) * head_dim
+    qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    v_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    rope = RotaryEmbedding(
+        head_size=head_dim,
+        rotary_dim=head_dim,
+        max_position_embeddings=4096,
+        base=10000.0,
+        is_neox_style=True,
+        dtype=dtype,
+    ).to(device)
+    empty_cache = torch.tensor([], dtype=dtype, device=device)
+
+    with set_current_vllm_config(vllm_config), set_forward_context(
+        None,
+        vllm_config,
+        slot_mapping={},
+    ):
+        attn.kv_cache = empty_cache
+        baseline_q, baseline_k, baseline_v = _baseline_post_gemm(
+            qkv,
+            positions,
+            q_weight,
+            k_weight,
+            v_weight,
+            rope.cos_sin_cache,
+            1e-6,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            True,
+            attn.layer_name,
+        )
+
+        attn.kv_cache = empty_cache
+        fused_q, fused_k, fused_v = _fused_post_gemm(
+            qkv,
+            positions,
+            q_weight,
+            k_weight,
+            v_weight,
+            rope.cos_sin_cache,
+            1e-6,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            True,
+            attn.layer_name,
+        )
+
+    atol, rtol = ((2e-3, 2e-3) if dtype == torch.float16 else (2e-2, 1e-2))
+    torch.testing.assert_close(baseline_q, fused_q, atol=atol, rtol=rtol)
+    torch.testing.assert_close(baseline_k, fused_k, atol=atol, rtol=rtol)
+    torch.testing.assert_close(baseline_v, fused_v, atol=atol, rtol=rtol)
+    assert attn.kv_cache.numel() == 0

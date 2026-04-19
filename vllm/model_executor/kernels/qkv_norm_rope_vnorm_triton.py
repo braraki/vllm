@@ -420,12 +420,13 @@ def _validate_full_post_gemm_fusion_support(
             "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update does not "
             "support KV-shared layers"
         )
-    if kv_cache is None:
-        raise RuntimeError("Attention layer KV cache is not initialized")
-    if not kv_cache.is_cuda or kv_cache.device != qkv.device:
-        raise RuntimeError("KV cache must be initialized on the same CUDA device")
-    if kv_cache.ndim < 4:
-        raise RuntimeError("Unexpected KV cache rank for TritonAttention")
+    if layer_slot_mapping is not None:
+        if kv_cache is None:
+            raise RuntimeError("Attention layer KV cache is not initialized")
+        if not kv_cache.is_cuda or kv_cache.device != qkv.device:
+            raise RuntimeError("KV cache must be initialized on the same CUDA device")
+        if kv_cache.ndim < 4:
+            raise RuntimeError("Unexpected KV cache rank for TritonAttention")
 
     return resolved_layer_name, attn_layer, kv_cache, layer_slot_mapping
 
@@ -762,31 +763,52 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
     k_offset = q_size + num_heads_k * head_dim
     grid = (num_tokens, total_heads)
     num_warps = 4 if head_dim == 256 else 8
+    no_kv_update = layer_slot_mapping is None
 
-    key_cache, value_cache = kv_cache.unbind(1)
-    use_head_major_layout = key_cache.ndim == 5
-    if use_head_major_layout:
-        block_size = key_cache.shape[3]
-        cache_x = key_cache.shape[4]
-        key_cache_page_stride = 0
-        key_cache_dim_stride = key_cache.stride(2)
-        value_cache_page_stride = 0
-        value_cache_dim_stride = value_cache.stride(2)
-    else:
-        block_size = key_cache.shape[1]
+    if no_kv_update:
+        # Startup/profile runs may hit this op before a real KV cache and slot
+        # mapping have been installed. Mirror unified_kv_cache_update semantics:
+        # still mutate qkv in place, but suppress cache writes.
+        key_cache = torch.empty(
+            (1, 1, 1, head_dim),
+            device=qkv.device,
+            dtype=qkv.dtype,
+        )
+        value_cache = torch.empty(
+            (1, 1, 1, head_dim),
+            device=qkv.device,
+            dtype=qkv.dtype,
+        )
+        use_head_major_layout = False
+        block_size = 1
         cache_x = 1
         key_cache_page_stride = key_cache.stride(1)
         key_cache_dim_stride = 0
         value_cache_page_stride = value_cache.stride(1)
         value_cache_dim_stride = 0
-
-    if layer_slot_mapping is None:
         layer_slot_mapping = torch.full(
             (num_tokens,),
             -1,
             dtype=torch.long,
             device=qkv.device,
         )
+    else:
+        key_cache, value_cache = kv_cache.unbind(1)
+        use_head_major_layout = key_cache.ndim == 5
+        if use_head_major_layout:
+            block_size = key_cache.shape[3]
+            cache_x = key_cache.shape[4]
+            key_cache_page_stride = 0
+            key_cache_dim_stride = key_cache.stride(2)
+            value_cache_page_stride = 0
+            value_cache_dim_stride = value_cache.stride(2)
+        else:
+            block_size = key_cache.shape[1]
+            cache_x = 1
+            key_cache_page_stride = key_cache.stride(1)
+            key_cache_dim_stride = 0
+            value_cache_page_stride = value_cache.stride(1)
+            value_cache_dim_stride = 0
 
     if is_neox:
         _fused_qkv_norm_rope_vnorm_kvcache_neox_kernel[grid](
@@ -849,6 +871,8 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
             num_stages=1,
         )
 
+    if no_kv_update:
+        return torch.empty(0, device=qkv.device, dtype=qkv.dtype)
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
 
