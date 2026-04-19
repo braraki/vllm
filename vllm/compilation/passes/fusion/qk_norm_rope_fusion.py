@@ -524,11 +524,11 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             stack.extend(inputs)
 
     def _resolve_part4_layer(self, layer_name: fx.Node | Any) -> Attention | None:
-        raw_value = (
-            layer_name.meta.get("val")
-            if isinstance(layer_name, fx.Node)
-            else layer_name
-        )
+        raw_value = layer_name
+        if isinstance(layer_name, fx.Node):
+            raw_value = layer_name.meta.get("val")
+            if raw_value is None:
+                raw_value = layer_name.meta.get("example_value")
         if raw_value is None:
             return None
         try:
