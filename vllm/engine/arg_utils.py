@@ -660,6 +660,7 @@ class EngineArgs:
         "qk-norm-rope-fusion-lt-512",
         "qk-norm-rope-fusion-512",
         "qkv-norm-rope-vnorm-fusion",
+        "qkv-norm-rope-vnorm-kvcache-fusion",
     ] = "baseline"
 
     def __post_init__(self):
@@ -1400,6 +1401,7 @@ class EngineArgs:
                 "qk-norm-rope-fusion-lt-512",
                 "qk-norm-rope-fusion-512",
                 "qkv-norm-rope-vnorm-fusion",
+                "qkv-norm-rope-vnorm-kvcache-fusion",
             ],
             default=EngineArgs.gemma4_kernel_experiment,
             help=(
@@ -1420,7 +1422,10 @@ class EngineArgs:
                 "'qkv-norm-rope-vnorm-fusion' enables the Gemma 4 CUDA "
                 "attention-prep compilation experiment that fuses Q/K "
                 "RMSNorm + RoPE together with weightless V RMSNorm on "
-                "non-KV-shared layers."
+                "non-KV-shared layers. "
+                "'qkv-norm-rope-vnorm-kvcache-fusion' extends that "
+                "experiment to also write K/V directly into the unified KV "
+                "cache, targeting the full post-GEMM pre-attention window."
             ),
         )
         vllm_group.add_argument(
@@ -2122,6 +2127,7 @@ class EngineArgs:
             "qk-norm-rope-fusion-lt-512",
             "qk-norm-rope-fusion-512",
             "qkv-norm-rope-vnorm-fusion",
+            "qkv-norm-rope-vnorm-kvcache-fusion",
         ):
             experiment_name = f"gemma4_kernel_experiment='{self.gemma4_kernel_experiment}'"
             if (
@@ -2129,6 +2135,7 @@ class EngineArgs:
                 in (
                     "qk-norm-rope-fusion-512",
                     "qkv-norm-rope-vnorm-fusion",
+                    "qkv-norm-rope-vnorm-kvcache-fusion",
                 )
                 and not current_platform.is_cuda()
             ):

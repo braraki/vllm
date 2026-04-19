@@ -124,6 +124,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
     def configure(self, config: VllmConfig) -> None:
         self.pass_config = config.compilation_config.pass_config
+        experiment_mode = str(
+            config.additional_config.get("gemma4_kernel_experiment", "baseline")
+        )
 
         # Set the current vllm config to allow tracing CustomOp instances
         with set_current_vllm_config(config, check_compile=False):
@@ -155,7 +158,10 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.fuse_act_padding and rocm_aiter_ops.is_enabled():
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
-            if self.pass_config.fuse_rope_kvcache:
+            if (
+                self.pass_config.fuse_rope_kvcache
+                and experiment_mode != "qkv-norm-rope-vnorm-kvcache-fusion"
+            ):
                 self.passes += [SplitCoalescingPass(config)]
                 self.passes += [ScatterSplitReplacementPass(config)]
                 self.passes += [RopeKVCacheFusionPass(config)]

@@ -484,6 +484,38 @@ def fused_qkv_norm_rope_vnorm(
     )
 
 
+def fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    layer_name,
+    forced_token_heads_per_warp: int = -1,
+) -> torch.Tensor:
+    return torch.ops.vllm.fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        is_neox,
+        position_ids,
+        layer_name,
+        forced_token_heads_per_warp,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

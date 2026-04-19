@@ -17,6 +17,8 @@ from vllm.model_executor.kernels import qkv_norm_rope_vnorm_triton as _qkv_norm_
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import _USE_LAYERNAME, _encode_layer_name
+from vllm.utils.torch_utils import is_quantized_kv_cache
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
@@ -30,6 +32,14 @@ FUSED_QKV_ROPE_VNORM_OP = (
     torch.ops.vllm.fused_qkv_norm_rope_vnorm.default
     if hasattr(torch.ops, "vllm")
     and hasattr(torch.ops.vllm, "fused_qkv_norm_rope_vnorm")
+    else None
+)
+FUSED_QKV_ROPE_VNORM_KVCACHE_OP = (
+    torch.ops.vllm.fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update.default
+    if hasattr(torch.ops, "vllm")
+    and hasattr(
+        torch.ops.vllm, "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update"
+    )
     else None
 )
 RMS_NORM_OP = torch.ops.vllm_ir.rms_norm.default
@@ -233,6 +243,23 @@ class QkNormRopePattern:
 class QKNormRoPEFusionPass(VllmPatternMatcherPass):
     """Fuse Q/K RMSNorm + RoPE into fused_qk_norm_rope when the custom op exists."""
 
+    @staticmethod
+    def _supports_part4_full_fusion(layer: Attention, head_dim: int) -> bool:
+        impl = layer.impl
+        if layer.kv_sharing_target_layer_name is not None:
+            return False
+        if head_dim not in CUDA_512_FUSED_QK_ROPE_HEAD_DIMS:
+            return False
+        if "flash_attn" not in impl.__class__.__module__:
+            return False
+        if getattr(impl, "attn_type", None) != "decoder":
+            return False
+        if getattr(impl, "dcp_world_size", 1) != 1:
+            return False
+        if is_quantized_kv_cache(getattr(impl, "kv_cache_dtype", "auto")):
+            return False
+        return True
+
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
@@ -245,6 +272,7 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         if experiment_mode in (
             "qk-norm-rope-fusion-512",
             "qkv-norm-rope-vnorm-fusion",
+            "qkv-norm-rope-vnorm-kvcache-fusion",
         ) and current_platform.is_cuda():
             supported_head_dims = CUDA_512_FUSED_QK_ROPE_HEAD_DIMS
         else:
@@ -264,6 +292,83 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             logger.warning_once(
                 "QK Norm+RoPE fusion enabled, but no Attention layers were discovered."
             )
+            return
+
+        if experiment_mode == "qkv-norm-rope-vnorm-kvcache-fusion":
+            if FUSED_QKV_ROPE_VNORM_KVCACHE_OP is None:
+                logger.warning(
+                    "Skipping qkv-norm-rope-vnorm-kvcache-fusion pattern "
+                    "registration because the fused Part 4 custom op is not "
+                    "available in torch.ops.vllm."
+                )
+                return
+
+            supported_layers = [
+                layer
+                for layer in attn_layers.values()
+                if self._supports_part4_full_fusion(layer, layer.head_size)
+            ]
+            supported_attn_signatures = sorted(
+                {
+                    (layer.head_size, layer.num_heads, layer.num_kv_heads)
+                    for layer in supported_layers
+                }
+            )
+            skipped_attn_signatures = sorted(
+                {
+                    (layer.head_size, layer.num_heads, layer.num_kv_heads)
+                    for layer in attn_layers.values()
+                    if (layer.head_size, layer.num_heads, layer.num_kv_heads)
+                    not in supported_attn_signatures
+                }
+            )
+            if skipped_attn_signatures:
+                logger.info(
+                    "Part 4 full post-GEMM fusion skipping unsupported "
+                    "attention signatures: %s",
+                    skipped_attn_signatures,
+                )
+            if not supported_attn_signatures:
+                logger.warning_once(
+                    "Part 4 full post-GEMM fusion not enabled: no supported "
+                    "Gemma4 FlashAttention decoder signatures found"
+                )
+                return
+
+            for epsilon in [1e-5, 1e-6]:
+                for neox in [True, False]:
+                    if _USE_LAYERNAME:
+                        for head_dim, num_heads, num_kv_heads in supported_attn_signatures:
+                            sample_layer = next(
+                                layer
+                                for layer in supported_layers
+                                if (
+                                    layer.head_size,
+                                    layer.num_heads,
+                                    layer.num_kv_heads,
+                                )
+                                == (head_dim, num_heads, num_kv_heads)
+                            )
+                            QKVNormRopeVNormKVCachePattern(
+                                head_dim=head_dim,
+                                num_heads=num_heads,
+                                num_kv_heads=num_kv_heads,
+                                eps=epsilon,
+                                is_neox=neox,
+                                layer_name=sample_layer.layer_name,
+                            ).register(self.patterns)
+                    else:
+                        for layer in supported_layers:
+                            QKVNormRopeVNormKVCachePattern(
+                                head_dim=layer.head_size,
+                                num_heads=layer.num_heads,
+                                num_kv_heads=layer.num_kv_heads,
+                                eps=epsilon,
+                                is_neox=neox,
+                                layer_name=layer.layer_name,
+                            ).register(self.patterns)
+
+            self.dump_patterns(config, self.patterns)
             return
 
         attn_signatures = sorted(
@@ -347,7 +452,12 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         logger.debug("Fused QK Norm+RoPE on %s sites", self.matched_count)
 
     def uuid(self) -> str:
-        return VllmInductorPass.hash_source(self, QkNormRopePattern)
+        return VllmInductorPass.hash_source(
+            self,
+            QkNormRopePattern,
+            QKVNormRopeVNormPattern,
+            QKVNormRopeVNormKVCachePattern,
+        )
 
 
 class QKVNormRopeVNormPattern:
@@ -487,6 +597,264 @@ class QKVNormRopeVNormPattern:
             )
             result_qkv = result[1]
             return result_qkv.split([q_size, kv_size, kv_size], dim=-1)  # type: ignore[no-any-return]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            QkNormRopePattern.wrap_trace_fn(
+                pm.fwd_only,
+                QkNormRopePattern.fx_view_to_reshape,
+            ),
+            pm_pass,
+            extra_check=signature_matches,
+        )
+
+
+class QKVNormRopeVNormKVCachePattern:
+    """Match the full post-GEMM prep + KV cache update sequence."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        eps: float,
+        is_neox: bool,
+        layer_name: str,
+    ) -> None:
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.eps = eps
+        self.is_neox = is_neox
+        self.layer_name = layer_name
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.rotary_op = MatcherRotaryEmbedding(
+            is_neox=is_neox,
+            head_size=self.head_dim,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+        ).rotary_op
+
+    def get_inputs(self) -> list:
+        T = 5
+        qkv = empty_bf16(T, self.q_size + 2 * self.kv_size)
+        positions = empty_i64(T)
+        q_weight = empty_bf16(1, self.head_dim)
+        k_weight = empty_bf16(1, self.head_dim)
+        cos_sin_cache = empty_bf16(4096, self.head_dim)
+        inputs: list = [qkv, positions, q_weight, k_weight, cos_sin_cache]
+        if _USE_LAYERNAME:
+            inputs.append(_encode_layer_name(self.layer_name))
+        return inputs
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def signature_matches(match: pm.Match) -> bool:
+            weighted_shapes: list[tuple[int, int]] = []
+            weightless_shapes: list[tuple[int, int]] = []
+            for node in match.nodes:
+                if node.target != RMS_NORM_OP:
+                    continue
+                x = node.args[0]
+                weight = node.args[1]
+                if not isinstance(x, fx.Node):
+                    return False
+                x_shape = tuple(x.meta["val"].shape)
+                if x_shape[-1] != self.head_dim:
+                    return False
+                if weight is None:
+                    weightless_shapes.append((x_shape[-2], x_shape[-1]))
+                    continue
+                if not isinstance(weight, fx.Node):
+                    return False
+                weight_shape = tuple(weight.meta["val"].shape)
+                if weight_shape[-1] != self.head_dim:
+                    return False
+                weighted_shapes.append((x_shape[-2], x_shape[-1]))
+
+            return (
+                (self.num_heads, self.head_dim) in weighted_shapes
+                and (self.num_kv_heads, self.head_dim) in weighted_shapes
+                and weightless_shapes.count((self.num_kv_heads, self.head_dim)) == 1
+            )
+
+        encoded_layer_name = _encode_layer_name(self.layer_name)
+
+        if _USE_LAYERNAME:
+
+            def pattern(
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+                layer_name,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                head_dim = q_weight.shape[-1]
+                kv_size = self.num_kv_heads * head_dim
+                q_size = qkv.shape[-1] - 2 * kv_size
+                q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+                num_heads_q = q.shape[-1] // head_dim
+
+                q_by_head = q.view(*q.shape[:-1], num_heads_q, head_dim)
+                q_normed_by_head = vllm.ir.ops.rms_norm(q_by_head, q_weight, self.eps)
+                q_flat = q_normed_by_head.view(q.shape)
+
+                k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, head_dim)
+                k_normed_by_head = vllm.ir.ops.rms_norm(
+                    k_by_head, k_weight, self.eps
+                )
+                k_flat = k_normed_by_head.view(k.shape)
+
+                result = auto_functionalized(
+                    self.rotary_op,
+                    positions=positions,
+                    query=q_flat,
+                    key=k_flat,
+                    head_size=head_dim,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=self.is_neox,
+                )
+                q_rope = result[1]
+                k_rope = result[2]
+
+                v_by_head = v.view(
+                    *v.shape[:-1], self.num_kv_heads, self.head_dim
+                )
+                v_normed_by_head = vllm.ir.ops.rms_norm(v_by_head, None, self.eps)
+                v_flat = v_normed_by_head.view(v.shape)
+
+                q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
+                k_heads = k_rope.view(-1, self.num_kv_heads, self.head_dim)
+                v_heads = v_flat.view(-1, self.num_kv_heads, self.head_dim)
+                kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
+                    k_heads, v_heads, layer_name
+                )
+                return kv_cache_dummy, q_heads, k_heads, v_heads
+
+            def replacement(
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+                layer_name,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                assert FUSED_QKV_ROPE_VNORM_KVCACHE_OP is not None
+                head_dim = q_weight.shape[-1]
+                kv_size = self.num_kv_heads * head_dim
+                q_size = qkv.shape[-1] - 2 * kv_size
+                num_heads_q = q_size // head_dim
+                result = auto_functionalized(
+                    FUSED_QKV_ROPE_VNORM_KVCACHE_OP,
+                    qkv=qkv,
+                    num_heads_q=num_heads_q,
+                    num_heads_k=self.num_kv_heads,
+                    num_heads_v=self.num_kv_heads,
+                    head_dim=head_dim,
+                    eps=self.eps,
+                    q_weight=q_weight,
+                    k_weight=k_weight,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=self.is_neox,
+                    position_ids=positions.view(-1),
+                    layer_name=layer_name,
+                    forced_token_heads_per_warp=-1,
+                )
+                result_qkv = result[1]
+                q, k, v = result_qkv.split([q_size, kv_size, kv_size], dim=-1)
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, self.num_kv_heads, self.head_dim)
+                return result[0], q, k, v
+
+        else:
+
+            def pattern(
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                head_dim = q_weight.shape[-1]
+                kv_size = self.num_kv_heads * head_dim
+                q_size = qkv.shape[-1] - 2 * kv_size
+                q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+                num_heads_q = q.shape[-1] // head_dim
+
+                q_by_head = q.view(*q.shape[:-1], num_heads_q, head_dim)
+                q_normed_by_head = vllm.ir.ops.rms_norm(q_by_head, q_weight, self.eps)
+                q_flat = q_normed_by_head.view(q.shape)
+
+                k_by_head = k.view(*k.shape[:-1], self.num_kv_heads, head_dim)
+                k_normed_by_head = vllm.ir.ops.rms_norm(
+                    k_by_head, k_weight, self.eps
+                )
+                k_flat = k_normed_by_head.view(k.shape)
+
+                result = auto_functionalized(
+                    self.rotary_op,
+                    positions=positions,
+                    query=q_flat,
+                    key=k_flat,
+                    head_size=head_dim,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=self.is_neox,
+                )
+                q_rope = result[1]
+                k_rope = result[2]
+
+                v_by_head = v.view(
+                    *v.shape[:-1], self.num_kv_heads, self.head_dim
+                )
+                v_normed_by_head = vllm.ir.ops.rms_norm(v_by_head, None, self.eps)
+                v_flat = v_normed_by_head.view(v.shape)
+
+                q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
+                k_heads = k_rope.view(-1, self.num_kv_heads, self.head_dim)
+                v_heads = v_flat.view(-1, self.num_kv_heads, self.head_dim)
+                kv_cache_dummy = torch.ops.vllm.unified_kv_cache_update(
+                    k_heads, v_heads, encoded_layer_name
+                )
+                return kv_cache_dummy, q_heads, k_heads, v_heads
+
+            def replacement(
+                qkv: torch.Tensor,
+                positions: torch.Tensor,
+                q_weight: torch.Tensor,
+                k_weight: torch.Tensor,
+                cos_sin_cache: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                assert FUSED_QKV_ROPE_VNORM_KVCACHE_OP is not None
+                head_dim = q_weight.shape[-1]
+                kv_size = self.num_kv_heads * head_dim
+                q_size = qkv.shape[-1] - 2 * kv_size
+                num_heads_q = q_size // head_dim
+                result = auto_functionalized(
+                    FUSED_QKV_ROPE_VNORM_KVCACHE_OP,
+                    qkv=qkv,
+                    num_heads_q=num_heads_q,
+                    num_heads_k=self.num_kv_heads,
+                    num_heads_v=self.num_kv_heads,
+                    head_dim=head_dim,
+                    eps=self.eps,
+                    q_weight=q_weight,
+                    k_weight=k_weight,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=self.is_neox,
+                    position_ids=positions.view(-1),
+                    layer_name=encoded_layer_name,
+                    forced_token_heads_per_warp=-1,
+                )
+                result_qkv = result[1]
+                q, k, v = result_qkv.split([q_size, kv_size, kv_size], dim=-1)
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, self.num_kv_heads, self.head_dim)
+                return result[0], q, k, v
 
         pm.register_replacement(
             pattern,

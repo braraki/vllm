@@ -177,6 +177,17 @@ class FixFunctionalizationPass(VllmInductorPass):
                 )
                 self.defunctionalize(graph, node, mutated_args=mutated_args, args=args)
             elif (
+                hasattr(torch.ops, "vllm")
+                and hasattr(
+                    torch.ops.vllm,
+                    "fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update",
+                )
+                and at_target
+                == torch.ops.vllm.fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update.default
+            ):
+                mutated_args = {1: "qkv"}
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif (
                 hasattr(torch.ops.vllm, "fused_rope_and_unified_kv_cache_update")
                 and at_target
                 == torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default
