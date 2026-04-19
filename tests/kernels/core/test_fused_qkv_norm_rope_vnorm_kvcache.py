@@ -12,6 +12,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import _encode_layer_name, set_random_seed
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 DTYPES = [torch.bfloat16, torch.float16]
 IS_NEOX = [True, False]
@@ -193,6 +194,7 @@ def test_fused_qkv_norm_rope_vnorm_kvcache_matches_reference(
             num_kv_heads=num_kv_heads,
             cache_config=vllm_config.cache_config,
             prefix="model.layers.0.self_attn.attn",
+            attn_backend=AttentionBackendEnum.FLASH_ATTN.get_class(),
         )
 
     total_dim = (num_heads + 2 * num_kv_heads) * head_dim

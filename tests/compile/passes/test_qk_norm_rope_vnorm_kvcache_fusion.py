@@ -28,6 +28,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import _encode_layer_name
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 VLLM_UNIFIED_KV_CACHE_UPDATE_OP = torch.ops.vllm.unified_kv_cache_update.default
 
@@ -93,6 +94,7 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
             num_kv_heads=num_kv_heads,
             cache_config=vllm_config.cache_config,
             prefix=prefix,
+            attn_backend=AttentionBackendEnum.FLASH_ATTN.get_class(),
         )
         self.q_norm = RMSNorm(head_dim, eps=eps)
         self.k_norm = RMSNorm(head_dim, eps=eps)

@@ -38,6 +38,7 @@ from vllm.utils.torch_utils import (
     _encode_layer_name,
     set_random_seed,
 )
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 DEFAULT_MODEL = "google/gemma-4-E2B-it"
 DEFAULT_NUM_TOKENS = [1, 4, 16, 64, 256, 1024]
@@ -299,6 +300,7 @@ def _make_case(
             num_kv_heads=num_kv_heads,
             cache_config=vllm_config.cache_config,
             prefix="model.layers.0.self_attn.attn",
+            attn_backend=AttentionBackendEnum.FLASH_ATTN.get_class(),
         )
         kv_cache = _allocate_kv_cache(
             attn=attn,
