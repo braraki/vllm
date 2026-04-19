@@ -45,6 +45,13 @@ DEFAULT_PROVIDERS = [
     "attention_prep_custom_op",
 ]
 
+REBUILD_VLLM_MESSAGE = (
+    "fused_qkv_norm_rope_vnorm custom op is not available. "
+    "Rebuild the editable vLLM install first with: "
+    "`cd ~/vllm && source .venv/bin/activate && "
+    "uv pip install -e . --torch-backend=auto`"
+)
+
 
 def _load_gemma4_attention_signatures(model: str) -> tuple[list[tuple[int, int, int]], float]:
     from transformers import AutoConfig
@@ -318,7 +325,7 @@ def validate_outputs(
         raise RuntimeError("validate_outputs requires CUDA")
 
     if not hasattr(torch.ops._C, "fused_qkv_norm_rope_vnorm"):
-        raise RuntimeError("fused_qkv_norm_rope_vnorm custom op is not available")
+        raise RuntimeError(REBUILD_VLLM_MESSAGE)
 
     set_random_seed(7)
     total_dim = (num_heads + 2 * num_kv_heads) * head_dim

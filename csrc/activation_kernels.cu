@@ -147,8 +147,6 @@ packed_gelu_tanh_kernel(const packed_t& val) {
   return cast_to_packed<packed_t>(fval);
 }
 
-}  // namespace vllm
-
 template <typename scalar_t, typename packed_t,
           scalar_t (*ACT_FN)(const scalar_t&),
           packed_t (*PACKED_ACT_FN)(const packed_t&), bool use_vec,
@@ -197,6 +195,8 @@ __global__ void two_input_act_and_mul_kernel(
     }
   }
 }
+
+}  // namespace vllm
 
 // Launch activation and gating kernel.
 // Use ACT_FIRST (bool) indicating whether to apply the activation function
