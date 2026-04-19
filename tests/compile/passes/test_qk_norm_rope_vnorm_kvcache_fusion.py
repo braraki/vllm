@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tests.compile.backend import TestBackend
+from vllm.engine.arg_utils import EngineArgs
 from vllm.compilation.passes.fusion.qk_norm_rope_fusion import (
     FUSED_QKV_ROPE_VNORM_KVCACHE_OP,
     QKNormRoPEFusionPass,
@@ -99,7 +100,9 @@ class QKVNormRoPEVNormKVCacheTestModel(torch.nn.Module):
         )
         self.q_norm = RMSNorm(head_dim, eps=eps)
         self.k_norm = RMSNorm(head_dim, eps=eps)
-        self.v_norm = RMSNorm(head_dim, eps=eps, has_weight=False)
+        # Match the effective serving graph shape, which carries a tensor
+        # in the V-norm weight slot.
+        self.v_norm = RMSNorm(head_dim, eps=eps)
         self.rotary_emb = RotaryEmbedding(
             head_size=head_dim,
             rotary_dim=head_dim,
@@ -315,6 +318,50 @@ def test_qkv_norm_rope_vnorm_kvcache_does_not_match_without_v_norm(dtype):
 
         assert fusion_pass.matched_count == 0
         assert backend.op_count(FUSED_QKV_ROPE_VNORM_KVCACHE_OP) == 0
+
+
+def test_part4_engine_config_removes_unified_kv_cache_update_split():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        gemma4_kernel_experiment="qkv-norm-rope-vnorm-kvcache-fusion",
+        compilation_config={
+            "mode": CompilationMode.VLLM_COMPILE,
+            "splitting_ops": [
+                "vllm::unified_attention_with_output",
+                "vllm::unified_kv_cache_update",
+                "vllm::unified_mla_kv_cache_update",
+            ],
+        },
+    )
+    vllm_config = engine_args.create_engine_config()
+    assert (
+        "vllm::unified_kv_cache_update"
+        not in vllm_config.compilation_config.splitting_ops
+    )
+    assert (
+        "vllm::unified_mla_kv_cache_update"
+        in vllm_config.compilation_config.splitting_ops
+    )
+
+
+def test_non_part4_engine_config_keeps_unified_kv_cache_update_split():
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        gemma4_kernel_experiment="qkv-norm-rope-vnorm-fusion",
+        compilation_config={
+            "mode": CompilationMode.VLLM_COMPILE,
+            "splitting_ops": [
+                "vllm::unified_attention_with_output",
+                "vllm::unified_kv_cache_update",
+                "vllm::unified_mla_kv_cache_update",
+            ],
+        },
+    )
+    vllm_config = engine_args.create_engine_config()
+    assert (
+        "vllm::unified_kv_cache_update"
+        in vllm_config.compilation_config.splitting_ops
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

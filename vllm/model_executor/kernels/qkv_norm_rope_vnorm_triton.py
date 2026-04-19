@@ -25,6 +25,7 @@ def _raise_if_unsupported(
     head_dim: int,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor | None,
     cos_sin_cache: torch.Tensor,
     position_ids: torch.Tensor,
 ) -> None:
@@ -38,11 +39,14 @@ def _raise_if_unsupported(
         raise RuntimeError("qkv must be a CUDA tensor")
     if not q_weight.is_cuda or not k_weight.is_cuda:
         raise RuntimeError("q_weight and k_weight must be CUDA tensors")
+    if v_weight is not None and not v_weight.is_cuda:
+        raise RuntimeError("v_weight must be a CUDA tensor")
     if not cos_sin_cache.is_cuda or not position_ids.is_cuda:
         raise RuntimeError("cos_sin_cache and position_ids must be CUDA tensors")
     if (
         q_weight.device != qkv.device
         or k_weight.device != qkv.device
+        or (v_weight is not None and v_weight.device != qkv.device)
         or cos_sin_cache.device != qkv.device
         or position_ids.device != qkv.device
     ):
@@ -61,10 +65,16 @@ def _raise_if_unsupported(
         raise RuntimeError("position_ids must be torch.int64")
     if q_weight.dim() != 1 or k_weight.dim() != 1:
         raise RuntimeError("q_weight and k_weight must be 1D tensors")
+    if v_weight is not None and v_weight.dim() != 1:
+        raise RuntimeError("v_weight must be a 1D tensor")
     if not q_weight.is_contiguous() or not k_weight.is_contiguous():
         raise RuntimeError("q_weight and k_weight must be contiguous")
+    if v_weight is not None and not v_weight.is_contiguous():
+        raise RuntimeError("v_weight must be contiguous")
     if q_weight.dtype != qkv.dtype or k_weight.dtype != qkv.dtype:
         raise RuntimeError("q_weight and k_weight must match qkv dtype")
+    if v_weight is not None and v_weight.dtype != qkv.dtype:
+        raise RuntimeError("v_weight must match qkv dtype")
     if cos_sin_cache.dim() != 2 or not cos_sin_cache.is_contiguous():
         raise RuntimeError("cos_sin_cache must be a contiguous 2D tensor")
     if cos_sin_cache.dtype not in (torch.float32, torch.float16, torch.bfloat16):
@@ -90,6 +100,8 @@ def _raise_if_unsupported(
         )
     if q_weight.numel() != head_dim or k_weight.numel() != head_dim:
         raise RuntimeError("q_weight and k_weight sizes must match head_dim")
+    if v_weight is not None and v_weight.numel() != head_dim:
+        raise RuntimeError("v_weight size must match head_dim")
     total_dim = (num_heads_q + num_heads_k + num_heads_v) * head_dim
     if qkv.size(1) != total_dim:
         raise RuntimeError("qkv packed width does not match heads * head_dim")
@@ -260,6 +272,7 @@ def _fused_qkv_norm_rope_vnorm_impl(
         head_dim,
         q_weight,
         k_weight,
+        None,
         cos_sin_cache,
         position_ids,
     )
@@ -354,6 +367,7 @@ def _validate_full_post_gemm_fusion_support(
     head_dim: int,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     position_ids: torch.Tensor,
     layer_name: LayerNameType,
@@ -368,6 +382,7 @@ def _validate_full_post_gemm_fusion_support(
         head_dim,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         position_ids,
     )
@@ -420,6 +435,7 @@ def _fused_qkv_norm_rope_vnorm_kvcache_neox_kernel(
     qkv_ptr,
     q_weight_ptr,
     k_weight_ptr,
+    v_weight_ptr,
     cos_sin_cache_ptr,
     position_ids_ptr,
     key_cache_ptr,
@@ -469,16 +485,20 @@ def _fused_qkv_norm_rope_vnorm_kvcache_neox_kernel(
     k_weight_second = tl.load(k_weight_ptr + HALF_BLOCK + half_offsets).to(
         tl.float32
     )
+    v_weight_first = tl.load(v_weight_ptr + half_offsets).to(tl.float32)
+    v_weight_second = tl.load(v_weight_ptr + HALF_BLOCK + half_offsets).to(
+        tl.float32
+    )
 
     weight_first = tl.where(
         is_q,
         q_weight_first,
-        tl.where(is_k, k_weight_first, 1.0),
+        tl.where(is_k, k_weight_first, v_weight_first),
     )
     weight_second = tl.where(
         is_q,
         q_weight_second,
-        tl.where(is_k, k_weight_second, 1.0),
+        tl.where(is_k, k_weight_second, v_weight_second),
     )
 
     norm_first = first * inv_rms * weight_first
@@ -562,6 +582,7 @@ def _fused_qkv_norm_rope_vnorm_kvcache_gptj_kernel(
     qkv_ptr,
     q_weight_ptr,
     k_weight_ptr,
+    v_weight_ptr,
     cos_sin_cache_ptr,
     position_ids_ptr,
     key_cache_ptr,
@@ -609,9 +630,19 @@ def _fused_qkv_norm_rope_vnorm_kvcache_gptj_kernel(
     q_weight_odd = tl.load(q_weight_ptr + odd_cols).to(tl.float32)
     k_weight_even = tl.load(k_weight_ptr + even_cols).to(tl.float32)
     k_weight_odd = tl.load(k_weight_ptr + odd_cols).to(tl.float32)
+    v_weight_even = tl.load(v_weight_ptr + even_cols).to(tl.float32)
+    v_weight_odd = tl.load(v_weight_ptr + odd_cols).to(tl.float32)
 
-    weight_even = tl.where(is_q, q_weight_even, tl.where(is_k, k_weight_even, 1.0))
-    weight_odd = tl.where(is_q, q_weight_odd, tl.where(is_k, k_weight_odd, 1.0))
+    weight_even = tl.where(
+        is_q,
+        q_weight_even,
+        tl.where(is_k, k_weight_even, v_weight_even),
+    )
+    weight_odd = tl.where(
+        is_q,
+        q_weight_odd,
+        tl.where(is_k, k_weight_odd, v_weight_odd),
+    )
 
     norm_even = even * inv_rms * weight_even
     norm_odd = odd * inv_rms * weight_odd
@@ -698,6 +729,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
     eps: float,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     position_ids: torch.Tensor,
@@ -718,6 +750,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
         head_dim,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         position_ids,
         layer_name,
@@ -760,6 +793,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
             qkv,
             q_weight,
             k_weight,
+            v_weight,
             cos_sin_cache,
             position_ids,
             key_cache,
@@ -789,6 +823,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_impl(
             qkv,
             q_weight,
             k_weight,
+            v_weight,
             cos_sin_cache,
             position_ids,
             key_cache,
@@ -826,6 +861,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_fake(
     eps: float,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     position_ids: torch.Tensor,
@@ -840,6 +876,7 @@ def _fused_qkv_norm_rope_vnorm_and_unified_kv_cache_update_fake(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         is_neox,
         position_ids,

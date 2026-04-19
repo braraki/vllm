@@ -644,8 +644,9 @@ class QKVNormRopeVNormKVCachePattern:
         positions = empty_i64(T)
         q_weight = empty_bf16(1, self.head_dim)
         k_weight = empty_bf16(1, self.head_dim)
+        v_weight = empty_bf16(1, self.head_dim)
         cos_sin_cache = empty_bf16(4096, self.head_dim)
-        inputs: list = [qkv, positions, q_weight, k_weight, cos_sin_cache]
+        inputs: list = [qkv, positions, q_weight, k_weight, v_weight, cos_sin_cache]
         if _USE_LAYERNAME:
             inputs.append(_encode_layer_name(self.layer_name))
         return inputs
@@ -675,9 +676,9 @@ class QKVNormRopeVNormKVCachePattern:
                 weighted_shapes.append((x_shape[-2], x_shape[-1]))
 
             return (
-                (self.num_heads, self.head_dim) in weighted_shapes
-                and (self.num_kv_heads, self.head_dim) in weighted_shapes
-                and weightless_shapes.count((self.num_kv_heads, self.head_dim)) == 1
+                weighted_shapes.count((self.num_heads, self.head_dim)) >= 1
+                and weighted_shapes.count((self.num_kv_heads, self.head_dim)) >= 2
+                and weightless_shapes.count((self.num_kv_heads, self.head_dim)) == 0
             )
 
         encoded_layer_name = _encode_layer_name(self.layer_name)
@@ -689,6 +690,7 @@ class QKVNormRopeVNormKVCachePattern:
                 positions: torch.Tensor,
                 q_weight: torch.Tensor,
                 k_weight: torch.Tensor,
+                v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
                 layer_name,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -723,7 +725,9 @@ class QKVNormRopeVNormKVCachePattern:
                 v_by_head = v.view(
                     *v.shape[:-1], self.num_kv_heads, self.head_dim
                 )
-                v_normed_by_head = vllm.ir.ops.rms_norm(v_by_head, None, self.eps)
+                v_normed_by_head = vllm.ir.ops.rms_norm(
+                    v_by_head, v_weight, self.eps
+                )
                 v_flat = v_normed_by_head.view(v.shape)
 
                 q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
@@ -739,6 +743,7 @@ class QKVNormRopeVNormKVCachePattern:
                 positions: torch.Tensor,
                 q_weight: torch.Tensor,
                 k_weight: torch.Tensor,
+                v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
                 layer_name,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -757,6 +762,7 @@ class QKVNormRopeVNormKVCachePattern:
                     eps=self.eps,
                     q_weight=q_weight,
                     k_weight=k_weight,
+                    v_weight=v_weight,
                     cos_sin_cache=cos_sin_cache,
                     is_neox=self.is_neox,
                     position_ids=positions.view(-1),
@@ -777,6 +783,7 @@ class QKVNormRopeVNormKVCachePattern:
                 positions: torch.Tensor,
                 q_weight: torch.Tensor,
                 k_weight: torch.Tensor,
+                v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 head_dim = q_weight.shape[-1]
@@ -810,7 +817,9 @@ class QKVNormRopeVNormKVCachePattern:
                 v_by_head = v.view(
                     *v.shape[:-1], self.num_kv_heads, self.head_dim
                 )
-                v_normed_by_head = vllm.ir.ops.rms_norm(v_by_head, None, self.eps)
+                v_normed_by_head = vllm.ir.ops.rms_norm(
+                    v_by_head, v_weight, self.eps
+                )
                 v_flat = v_normed_by_head.view(v.shape)
 
                 q_heads = q_rope.view(-1, self.num_heads, self.head_dim)
@@ -826,6 +835,7 @@ class QKVNormRopeVNormKVCachePattern:
                 positions: torch.Tensor,
                 q_weight: torch.Tensor,
                 k_weight: torch.Tensor,
+                v_weight: torch.Tensor,
                 cos_sin_cache: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
                 assert FUSED_QKV_ROPE_VNORM_KVCACHE_OP is not None
@@ -843,6 +853,7 @@ class QKVNormRopeVNormKVCachePattern:
                     eps=self.eps,
                     q_weight=q_weight,
                     k_weight=k_weight,
+                    v_weight=v_weight,
                     cos_sin_cache=cos_sin_cache,
                     is_neox=self.is_neox,
                     position_ids=positions.view(-1),

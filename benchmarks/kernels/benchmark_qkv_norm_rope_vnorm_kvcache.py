@@ -10,7 +10,7 @@ Baseline:
     q = q_norm(q)
     k = k_norm(k)
     q, k = rotary_emb(positions, q, k)
-    v = v_norm(v)
+    v = v_norm(v, v_weight)
     unified_kv_cache_update(k, v, layer_name)
 
 New kernel:
@@ -177,6 +177,7 @@ def baseline_post_gemm(
     positions: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
     num_heads: int,
@@ -223,7 +224,7 @@ def baseline_post_gemm(
         eps,
         head_dim,
         v.dtype,
-        None,
+        v_weight,
     ).view(v.shape)
 
     q_heads = q.view(-1, num_heads, head_dim)
@@ -242,6 +243,7 @@ def post_gemm_kvcache_custom_op(
     positions: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
     num_heads: int,
@@ -261,6 +263,7 @@ def post_gemm_kvcache_custom_op(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         is_neox,
         positions.view(-1),
@@ -315,6 +318,7 @@ def _make_case(
     positions = torch.arange(num_tokens, dtype=torch.long, device="cuda")
     q_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
     k_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
+    v_weight = torch.ones(head_dim, dtype=dtype, device="cuda")
     cos_sin_cache = _make_rope_cache(4096, head_dim, dtype, is_neox)
     slot_mapping = torch.arange(num_tokens, dtype=torch.long, device="cuda")
     attn.kv_cache = kv_cache
@@ -324,6 +328,7 @@ def _make_case(
         "positions": positions,
         "q_weight": q_weight,
         "k_weight": k_weight,
+        "v_weight": v_weight,
         "cos_sin_cache": cos_sin_cache,
         "eps": eps,
         "num_heads": num_heads,
@@ -371,6 +376,7 @@ def benchmark_provider(
         case["positions"],
         case["q_weight"],
         case["k_weight"],
+        case["v_weight"],
         case["cos_sin_cache"],
         eps,
         num_heads,
@@ -445,6 +451,7 @@ def validate_outputs(
             case["positions"],
             case["q_weight"],
             case["k_weight"],
+            case["v_weight"],
             case["cos_sin_cache"],
             eps,
             num_heads,
@@ -460,6 +467,7 @@ def validate_outputs(
             case["positions"],
             case["q_weight"],
             case["k_weight"],
+            case["v_weight"],
             case["cos_sin_cache"],
             eps,
             num_heads,

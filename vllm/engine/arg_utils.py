@@ -2167,6 +2167,12 @@ class EngineArgs:
                 compilation_config.custom_ops.append("+rms_norm")
             if "+rotary_embedding" not in compilation_config.custom_ops:
                 compilation_config.custom_ops.append("+rotary_embedding")
+            if self.gemma4_kernel_experiment == "qkv-norm-rope-vnorm-kvcache-fusion":
+                compilation_config.splitting_ops = [
+                    op
+                    for op in compilation_config.splitting_ops
+                    if op != "vllm::unified_kv_cache_update"
+                ]
 
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,

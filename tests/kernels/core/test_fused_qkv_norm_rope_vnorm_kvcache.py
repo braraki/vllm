@@ -56,6 +56,7 @@ def _baseline_post_gemm(
     positions: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
     num_heads: int,
@@ -102,7 +103,7 @@ def _baseline_post_gemm(
         eps,
         head_dim,
         v.dtype,
-        None,
+        v_weight,
     ).view(v.shape)
 
     q_heads = q.view(-1, num_heads, head_dim)
@@ -121,6 +122,7 @@ def _fused_post_gemm(
     positions: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     eps: float,
     num_heads: int,
@@ -139,6 +141,7 @@ def _fused_post_gemm(
         eps,
         q_weight,
         k_weight,
+        v_weight,
         cos_sin_cache,
         is_neox,
         positions.view(-1),
@@ -202,6 +205,7 @@ def test_fused_qkv_norm_rope_vnorm_kvcache_matches_reference(
     positions = torch.arange(num_tokens, dtype=torch.long, device=device)
     q_weight = torch.randn(head_dim, dtype=dtype, device=device)
     k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    v_weight = torch.ones(head_dim, dtype=dtype, device=device)
     rope = RotaryEmbedding(
         head_size=head_dim,
         rotary_dim=head_dim,
@@ -232,6 +236,7 @@ def test_fused_qkv_norm_rope_vnorm_kvcache_matches_reference(
             positions,
             q_weight,
             k_weight,
+            v_weight,
             rope.cos_sin_cache,
             eps,
             num_heads,
@@ -247,6 +252,7 @@ def test_fused_qkv_norm_rope_vnorm_kvcache_matches_reference(
             positions,
             q_weight,
             k_weight,
+            v_weight,
             rope.cos_sin_cache,
             eps,
             num_heads,
