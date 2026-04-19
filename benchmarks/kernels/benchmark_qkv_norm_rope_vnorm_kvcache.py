@@ -300,6 +300,13 @@ def _make_case(
             cache_config=vllm_config.cache_config,
             prefix="model.layers.0.self_attn.attn",
         )
+        kv_cache = _allocate_kv_cache(
+            attn=attn,
+            block_size=vllm_config.cache_config.block_size,
+            num_tokens=num_tokens,
+            dtype=dtype,
+            device=torch.device("cuda"),
+        )
 
     total_dim = (num_heads + 2 * num_kv_heads) * head_dim
     qkv = torch.randn(num_tokens, total_dim, dtype=dtype, device="cuda")
@@ -308,13 +315,6 @@ def _make_case(
     k_weight = torch.randn(head_dim, dtype=dtype, device="cuda")
     cos_sin_cache = _make_rope_cache(4096, head_dim, dtype, is_neox)
     slot_mapping = torch.arange(num_tokens, dtype=torch.long, device="cuda")
-    kv_cache = _allocate_kv_cache(
-        attn=attn,
-        block_size=vllm_config.cache_config.block_size,
-        num_tokens=num_tokens,
-        dtype=dtype,
-        device=qkv.device,
-    )
     attn.kv_cache = kv_cache
 
     case: dict[str, torch.Tensor | str | float | int | bool] = {
